@@ -12,7 +12,9 @@ use openvfs::{PhysicalFsBuilder, Walk};
 
 // --- compile-time guarantees ---------------------------------------------------
 
+#[allow(dead_code)] // only used in const contexts; older rustc flags it
 const fn assert_send_sync<T: Send + Sync>() {}
+#[allow(dead_code)]
 const fn assert_send<T: Send>() {}
 
 const _: () = {

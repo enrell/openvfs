@@ -360,6 +360,9 @@ fn overlay_listings_never_observe_half_applied_changes() {
             vfs.rename("/left", "/right").unwrap();
             overlay.reset().unwrap();
             rounds += 1;
+            // Without a pause this loop hogs the write lock, and where `RwLock` favours writers (Linux)
+            // the observer is starved instead of racing with us.
+            thread::sleep(Duration::from_millis(1));
         }
         stop.store(true, Ordering::Relaxed);
         observer.join().unwrap();

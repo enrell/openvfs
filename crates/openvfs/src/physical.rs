@@ -332,6 +332,9 @@ impl FileSystem for PhysicalFs {
             let Some(file_type) = self.entry_type(&entry) else { continue };
             entries.push(DirEntry { path: path.child(&name), name, file_type });
         }
+        // Hosts list in arbitrary order (ext4, APFS); every other backend is sorted, and callers such as
+        // `copy_tree` fail at a different point when the order differs.
+        entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
 

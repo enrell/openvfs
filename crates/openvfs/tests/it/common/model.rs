@@ -47,7 +47,8 @@ pub fn random_path(rng: &mut Rng) -> String {
     let mut path = String::new();
     for _ in 0..depth {
         path.push('/');
-        path.push_str(*rng.pick(&NAMES));
+        let name: &&str = rng.pick(&NAMES);
+        path.push_str(name);
     }
     path
 }
