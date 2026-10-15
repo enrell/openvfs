@@ -29,7 +29,7 @@ jobs:
       - name: Release notes from CHANGELOG.md
         run: |
           version="${GITHUB_REF_NAME#v}"
-          awk -v v="$version" '$0 ~ "^## \[" v "\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notes.md
+          awk -v v="$version" 'index($0, "## [" v "]") == 1 {f=1; next} index($0, "## [") == 1 {f=0} f' CHANGELOG.md > notes.md
           test -s notes.md || { echo "no CHANGELOG entry for $version"; exit 1; }
 
       - name: GitHub release
