@@ -63,7 +63,7 @@ pub use memory::MemoryFs;
 pub use mount::MountFs;
 pub use ops::Walk;
 pub use overlay::{Change, OverlayFs};
-pub use path::VPath;
+pub use path::{FoldedPath, VPath};
 pub use physical::{PhysicalFs, PhysicalFsBuilder, Symlinks};
 pub use readonly::ReadOnlyFs;
 pub use vfs::Vfs;
@@ -71,7 +71,7 @@ pub use vfs::Vfs;
 /// Everything needed for typical use: `use openvfs::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        Change, DirEntry, FileSystem, FileType, MemoryFs, Metadata, MountFs, OpenOptions, OverlayFs, PhysicalFs,
-        ReadOnlyFs, Symlinks, VPath, Vfs, VfsError, VfsFile,
+        Change, DirEntry, FileSystem, FileType, FoldedPath, MemoryFs, Metadata, MountFs, OpenOptions, OverlayFs,
+        PhysicalFs, ReadOnlyFs, Symlinks, VPath, Vfs, VfsError, VfsFile,
     };
 }
