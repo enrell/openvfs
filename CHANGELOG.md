@@ -3,7 +3,14 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/); o projeto segue
 [SemVer](https://semver.org/lang/pt-BR/).
 
-## [0.1.0] — não publicado
+## [0.1.1] — 2026-10-15
+
+### Corrigido
+- `PhysicalFs::read_dir` devolve as entradas ordenadas por nome. Em Linux e macOS a ordem do disco é arbitrária, o que
+  fazia operações como `copy_tree` falharem em pontos diferentes dos outros backends.
+- Testes passam em Linux, macOS, Windows e Rust 1.88 (a CI rodou pela primeira vez nesta versão).
+
+## [0.1.0] — 2026-10-15
 
 Primeira versão sob o nome **openvfs** (antes era um protótipo chamado "strata").
 
