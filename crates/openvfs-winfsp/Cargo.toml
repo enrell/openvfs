@@ -1,0 +1,26 @@
+[package]
+name = "openvfs-winfsp"
+description = "Mount any openvfs FileSystem as a real Windows filesystem via WinFsp (bound dynamically at runtime — no SDK needed)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+openvfs = { package = "open-vfs", path = "../openvfs" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+# NOTE: this crate deliberately does NOT inherit `[lints] workspace = true`.
+# The workspace sets `unsafe_code = "forbid"`, but a WinFsp host must both call
+# into a C ABI and expose raw `extern "C"` callbacks to it, so unsafe code is
+# unavoidable. All of it is confined to the `sys` and `cb` modules; every unsafe
+# block carries a `// SAFETY:` justification, and `#![deny(unsafe_op_in_unsafe_fn)]`
+# keeps individual operations explicit. See `src/sys.rs` for the audit notes.
