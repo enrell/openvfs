@@ -3,6 +3,9 @@
 
 #![allow(dead_code, clippy::cast_possible_truncation, clippy::cast_lossless)] // test helpers cast freely
 
+pub mod faulty;
+pub mod scenario;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -82,6 +85,22 @@ impl Rng {
     /// Uniform in `0..n`.
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
+    }
+
+    /// `true` with probability `percent`%.
+    pub fn chance(&mut self, percent: u64) -> bool {
+        self.next_u64() % 100 < percent
+    }
+
+    /// A random element of `items`.
+    pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.below(items.len())]
+    }
+
+    /// Up to `max_len` random bytes.
+    pub fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+        let len = self.below(max_len + 1);
+        (0..len).map(|_| self.next_u64() as u8).collect()
     }
 }
 
@@ -246,6 +265,27 @@ pub fn names(fs: &dyn FileSystem, dir: &str) -> Vec<String> {
     let mut names: Vec<String> = fs.read_dir(&VPath::new(dir).unwrap()).unwrap().into_iter().map(|e| e.name).collect();
     names.sort();
     names
+}
+
+/// Folds a tree's paths to lowercase — the key space [`MergedIndex`] and
+/// `deploy` work in. Panics when two different entries fold to the same
+/// path: a folded view cannot express the difference (the deployment
+/// itself never creates folded twins, and the host tests cannot either).
+pub fn folded(tree: &Tree) -> Tree {
+    let mut out = Tree::new();
+    for (path, entry) in tree {
+        let key = path.to_lowercase();
+        match out.entry(key.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(existing) if existing.get() == entry => {}
+            std::collections::btree_map::Entry::Occupied(existing) => {
+                panic!("folded collision at {key}: {:?} vs {entry:?}", existing.get())
+            }
+        }
+    }
+    out
 }
 
 /// A backend that behaves like a mod manifest: it knows files and their

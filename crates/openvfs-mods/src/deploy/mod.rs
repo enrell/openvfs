@@ -33,7 +33,13 @@
 //! [`Deployer::resume`] simply finishes (re-running a pending op converges)
 //! or [`Deployer::rollback`] unwinds in reverse. A *completed* deployment is
 //! undone by [`Deployer::undeploy`], driven by the manifest rather than the
-//! journal.
+//! journal. See `docs/recovery.md` for the operator-facing recovery guide.
+//!
+//! [`Deployer::deploy_with`] is the deliberate seam for exercising that
+//! model: a hook called at both edges of every step — after the `pending`
+//! record is synced and again after the op ran — so tests (or a progress
+//! UI that wants a veto) can abandon the apply at any point and leave a
+//! journal indistinguishable from a real crash's.
 //!
 //! # The hardlink caveat — read before choosing [`DeployMode::Link`]
 //!
@@ -125,6 +131,24 @@ pub struct CorruptedFile {
     pub source: PathBuf,
 }
 
+/// Where in a journaled step the [`Deployer::deploy_with`] hook runs.
+///
+/// ```text
+/// journal: pending(seq) ── synced ──> Before ──> apply op ──> After ──> journal: done(seq)
+/// ```
+///
+/// An error at [`OpPhase::Before`] leaves the op never-run behind a
+/// `pending` record; an error at [`OpPhase::After`] leaves the op fully
+/// applied but unacknowledged — the two crash shapes a WAL can produce.
+/// [`Deployer::resume`] and [`Deployer::rollback`] converge from either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpPhase {
+    /// The `pending` record is journaled and synced; the op has not run.
+    Before,
+    /// The op's effects are on disk; its `done` record is not yet journaled.
+    After,
+}
+
 /// Counts from [`Deployer::deploy`], [`resume`](Deployer::resume),
 /// [`rollback`](Deployer::rollback) and [`undeploy`](Deployer::undeploy).
 #[derive(Debug, Default, Clone)]
@@ -210,7 +234,24 @@ impl Deployer {
     ) -> Result<DeploymentPlan> {
         let mut roots: Vec<PathBuf> = built.mods().iter().map(|m| m.source_dir().to_path_buf()).collect();
         roots.push(game_dir.to_path_buf());
-        plan::compute(index, &roots, game_dir, &self.state_dir, options)
+        let plan = plan::compute(index, &roots, game_dir, &self.state_dir, options)?;
+        log::info!(
+            "plan built: ops={} files={} dirs={} foreign={} unreachable={} game_dir={} state_dir={}",
+            plan.ops.len(),
+            plan.files.len(),
+            plan.created_dirs.len(),
+            plan.foreign.len(),
+            plan.unreachable.len(),
+            plan.game_dir.display(),
+            self.state_dir.display(),
+        );
+        for foreign in &plan.foreign {
+            log::debug!("foreign file kept: {foreign}");
+        }
+        for lost in &plan.unreachable {
+            log::info!("unreachable (ancestor deploys as a file): {lost}");
+        }
+        Ok(plan)
     }
 
     /// Applies `plan`, journaling each step. Equivalent to
@@ -229,6 +270,34 @@ impl Deployer {
     /// [`Deployer::rollback`] to undo. Outside tests this is still useful
     /// for progress reporting; `deploy` is `deploy_partial(plan, usize::MAX)`.
     pub fn deploy_partial(&self, plan: &DeploymentPlan, max_ops: usize) -> Result<DeployReport> {
+        let journal = self.begin(plan)?;
+        self.run(plan, journal, &BTreeSet::new(), max_ops, &mut |_, _, _| Ok(()))
+    }
+
+    /// [`Deployer::deploy`] with a hook inside every journaled step.
+    ///
+    /// `hook(phase, seq, op)` is called twice per step — see [`OpPhase`]:
+    /// once after the `pending` record is synced and once after the op's
+    /// effects hit disk but before its `done` record is written. Returning
+    /// `Err` abandons the deployment exactly there, leaving a journal that
+    /// [`Deployer::resume`] finishes or [`Deployer::rollback`] unwinds.
+    ///
+    /// This is the **fault-injection seam** used by the crash-recovery
+    /// tests; it doubles as a progress/veto callback (log ops, abort on a
+    /// condition). The hook runs *inside* the transaction — keep it cheap:
+    /// an fsync sits on each side of it.
+    pub fn deploy_with(
+        &self,
+        plan: &DeploymentPlan,
+        mut hook: impl FnMut(OpPhase, u64, &DeployOp) -> Result<()>,
+    ) -> Result<DeployReport> {
+        let journal = self.begin(plan)?;
+        self.run(plan, journal, &BTreeSet::new(), usize::MAX, &mut hook)
+    }
+
+    /// The shared start of `deploy_partial`/`deploy_with`: refuse to stack
+    /// onto an in-flight journal, then write the plan record.
+    fn begin(&self, plan: &DeploymentPlan) -> Result<Journal> {
         if Journal::exists(&self.state_dir) {
             return Err(Error::Deploy {
                 reason: "an interrupted deployment is in flight — call resume() or rollback() first".into(),
@@ -237,7 +306,8 @@ impl Deployer {
         fs::create_dir_all(&self.state_dir)?;
         let mut journal = Journal::open(&self.state_dir)?;
         journal.append(&JournalRecord::Plan { plan: plan.clone() })?;
-        self.run(plan, journal, &BTreeSet::new(), max_ops)
+        log::info!("deploy started: ops={} state_dir={}", plan.ops.len(), self.state_dir.display());
+        Ok(journal)
     }
 
     /// Finishes an interrupted deployment: re-runs every journaled `pending`
@@ -254,9 +324,21 @@ impl Deployer {
                 reason: "journal has no plan record; the deployment cannot resume — use rollback()".into(),
             });
         };
-        let done: BTreeSet<u64> = state.steps.iter().filter(|(_, (_, done))| *done).map(|(seq, _)| *seq).collect();
+        // A `done` only counts when its `pending` record survived too. A
+        // done-without-pending can only come from corruption — a real crash
+        // always leaves `pending` first — so the step's outcome is unknown
+        // and the safest recovery is to run it again (idempotent, so the
+        // journal self-heals). Stray seqs beyond the plan's range are
+        // ignored rather than wedging the run.
+        let done: BTreeSet<u64> =
+            state.steps.iter().filter(|(_, (op, done))| *done && op.is_some()).map(|(seq, _)| *seq).collect();
+        let orphans = state.steps.iter().filter(|(_, (op, done))| *done && op.is_none()).count();
+        if orphans > 0 {
+            log::warn!("resume: {orphans} journal done-record(s) without their pending — re-running those steps");
+        }
         let journal = Journal::open_append(&self.state_dir)?;
-        self.run(&plan, journal, &done, usize::MAX)
+        log::info!("resume: done={} remaining={}", done.len(), plan.ops.len().saturating_sub(done.len()));
+        self.run(&plan, journal, &done, usize::MAX, &mut |_, _, _| Ok(()))
     }
 
     /// Undoes an *in-flight* deployment: every journaled step in reverse
@@ -273,6 +355,7 @@ impl Deployer {
         // lines themselves — a torn first write still unwinds cleanly.
         let planned = state.plan.as_ref().map(|p| p.ops.as_slice());
         let executed: BTreeSet<u64> = state.steps.keys().copied().collect();
+        log::info!("rollback: undoing {} journaled step(s) state_dir={}", executed.len(), self.state_dir.display());
         for seq in executed.iter().rev() {
             let op = planned
                 .and_then(|ops| usize::try_from(*seq).ok().and_then(|i| ops.get(i)))
@@ -282,6 +365,12 @@ impl Deployer {
             }
         }
         Journal::remove(&self.state_dir);
+        log::info!(
+            "rollback done: restored={} removed={} dirs_removed={}",
+            report.restored,
+            report.removed,
+            report.dirs_removed
+        );
         Ok(report)
     }
 
@@ -307,6 +396,12 @@ impl Deployer {
         let game_dir = manifest.game_dir.clone();
         let mut report = DeployReport::default();
         let mut overwrite = Overwrite::new(overwrite_dir, manifest.overwrite_dir.as_deref());
+        log::info!(
+            "undeploy: entries={} game_dir={} state_dir={}",
+            manifest.entries.len(),
+            game_dir.display(),
+            self.state_dir.display()
+        );
         for entry in manifest.deployed() {
             let host = state::host_path_str(&game_dir, &entry.path);
             match fs::symlink_metadata(&host) {
@@ -317,6 +412,7 @@ impl Deployer {
                     } else {
                         let target = overwrite.capture_target(&game_dir, &entry.path)?;
                         capture_move(&host, &target)?;
+                        log::debug!("undeploy: captured modified deployed file {}", entry.path);
                         report.captured.push(CapturedFile { path: entry.path.clone(), target });
                         // If the write went through a hardlink, it reached the
                         // mod file too — the original bytes are gone.
@@ -330,7 +426,10 @@ impl Deployer {
                     }
                 }
                 Ok(_) => report.skipped += 1, // a directory now sits there — leave it
-                Err(e) if e.kind() == io::ErrorKind::NotFound => report.skipped += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    report.skipped += 1;
+                    log::debug!("undeploy: {} already gone", entry.path);
+                }
                 Err(e) => return Err(e.into()),
             }
             if let Some(backup) = &entry.backup {
@@ -367,8 +466,24 @@ impl Deployer {
                 report.dirs_removed += 1;
             }
         }
+        // Anything left in `backup/` outside `stray/` is a displaced
+        // original the manifest could not attach to a file entry — a file
+        // displaced by a *created* directory. Restore it at its rel path,
+        // never overwriting: a new occupant there is the user's own write.
+        let backup_root = Manifest::backup_root(&self.state_dir);
+        if backup_root.is_dir() {
+            restore_orphans(&backup_root, &game_dir, &mut report)?;
+        }
         Manifest::remove(&self.state_dir);
         Journal::remove(&self.state_dir);
+        log::info!(
+            "undeploy done: removed={} restored={} captured={} dirs_removed={} unrecoverable={}",
+            report.removed,
+            report.restored,
+            report.captured.len(),
+            report.dirs_removed,
+            report.unrecoverable.len()
+        );
         Ok(report)
     }
 
@@ -426,6 +541,23 @@ impl Deployer {
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut kinds = [0usize; 4];
+        for m in &out {
+            kinds[match m.kind {
+                MismatchKind::Missing => 0,
+                MismatchKind::Modified => 1,
+                MismatchKind::Foreign => 2,
+                MismatchKind::WrongType => 3,
+            }] += 1;
+        }
+        log::info!(
+            "verify: missing={} modified={} foreign={} wrong_type={} game_dir={}",
+            kinds[0],
+            kinds[1],
+            kinds[2],
+            kinds[3],
+            game_dir.display()
+        );
         Ok(out)
     }
 
@@ -459,6 +591,12 @@ impl Deployer {
         }
         let disk = state::scan_dir(&game_dir, &exclude)?;
         let mut report = CaptureReport::default();
+        log::info!(
+            "capture: entries={} foreign_known={} game_dir={}",
+            manifest.entries.len(),
+            manifest.foreign.len(),
+            game_dir.display()
+        );
 
         for entry in &manifest.entries {
             let host = state::host_path_str(&game_dir, &entry.path);
@@ -495,6 +633,11 @@ impl Deployer {
                         place_file(&source, &host, force_copy)?;
                         report.repaired.push(entry.path.clone());
                     } else {
+                        log::warn!(
+                            "capture: in-place write through a hardlink corrupted mod file {} ({})",
+                            source.display(),
+                            entry.path
+                        );
                         report.corrupted.push(CorruptedFile { path: entry.path.clone(), source });
                     }
                 }
@@ -520,20 +663,31 @@ impl Deployer {
                 }
             }
         }
+        log::info!(
+            "capture done: moved={} repaired={} corrupted={} lost={} kept_foreign={}",
+            report.moved.len(),
+            report.repaired.len(),
+            report.corrupted.len(),
+            report.lost.len(),
+            report.kept_foreign
+        );
         Ok(report)
     }
 
     /// The step loop shared by `deploy` and `resume`: journal `pending` +
-    /// fsync, execute, journal `done` + fsync. Writes the manifest once
-    /// every op is marked done — after which the journal, a finished WAL, is
+    /// fsync, execute, journal `done` + fsync — with the `deploy_with` hook
+    /// called at both edges of each step. Writes the manifest once every op
+    /// the plan knows is done — after which the journal, a finished WAL, is
     /// removed (the handle must be dropped first: Windows refuses to delete
-    /// an open file).
+    /// an open file). `done` seqs beyond the plan's range (journal
+    /// corruption) are ignored rather than wedging the completion check.
     fn run(
         &self,
         plan: &DeploymentPlan,
         mut journal: Journal,
         done: &BTreeSet<u64>,
         limit: usize,
+        hook: &mut dyn FnMut(OpPhase, u64, &DeployOp) -> Result<()>,
     ) -> Result<DeployReport> {
         let mut report = DeployReport { foreign: plan.foreign.clone(), ..DeployReport::default() };
         // What each placement op actually did — the manifest's `method`.
@@ -549,16 +703,32 @@ impl Deployer {
                 break;
             }
             journal.append(&JournalRecord::Pending { seq, op: op.clone() })?;
+            hook(OpPhase::Before, seq, op)?;
+            log::debug!("op {seq} apply: {}", describe(op));
             if let Some((link, method)) = apply_op(op, &mut report)? {
                 placed.insert(link, method);
             }
+            hook(OpPhase::After, seq, op)?;
             journal.append(&JournalRecord::Done { seq })?;
             ran += 1;
+            log::debug!("op {seq} done: {}", describe(op));
         }
-        if done.len() + ran == plan.ops.len() {
+        // `done` may carry seqs the plan never had (corrupt journal) — count
+        // only the plan's own unfinished ops, so they cannot wedge the run.
+        let remaining = plan.ops.iter().enumerate().filter(|(i, _)| !done.contains(&(*i as u64))).count();
+        if ran == remaining {
             self.write_manifest(plan, &placed)?;
             drop(journal);
             Journal::remove(&self.state_dir);
+            log::info!(
+                "deploy finished: linked={} copied={} removed={} backed_up={} skipped={} state_dir={}",
+                report.linked,
+                report.copied,
+                report.removed,
+                report.backed_up,
+                report.skipped,
+                self.state_dir.display()
+            );
         }
         Ok(report)
     }
@@ -631,7 +801,62 @@ impl Deployer {
             dirs: plan.created_dirs.clone(),
             foreign,
         }
-        .save(&self.state_dir)
+        .save(&self.state_dir)?;
+        log::debug!(
+            "manifest written: entries={} dirs={} foreign={} path={}",
+            plan.files.len(),
+            plan.created_dirs.len(),
+            plan.foreign.len(),
+            Manifest::path(&self.state_dir).display()
+        );
+        Ok(())
+    }
+}
+
+/// Restores displaced originals left under `backup/` at the end of an
+/// undeploy, member-wise: whole directories when their game-dir path is
+/// free, entry-by-entry into a surviving directory, never over an existing
+/// file. The `stray/` subtree is skipped — those are preserved non-originals
+/// a human must sort out (see `docs/recovery.md`).
+fn restore_orphans(backup_dir: &Path, game_dir: &Path, report: &mut DeployReport) -> Result<()> {
+    for entry in fs::read_dir(backup_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "stray" {
+            continue;
+        }
+        let from = entry.path();
+        let to = game_dir.join(&name);
+        let is_dir = fs::symlink_metadata(&from).is_ok_and(|m| m.is_dir());
+        match (is_dir, fs::symlink_metadata(&to)) {
+            (true, Ok(m)) if m.is_dir() => {
+                // A directory still stands there — restore member-wise,
+                // then drop the emptied backup directory.
+                restore_orphans(&from, &to, report)?;
+                let _ = fs::remove_dir(&from);
+            }
+            (_, Ok(_)) => {} // occupied: leave the backup in place
+            (_, Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                state::move_any(&from, &to)?;
+                report.restored += 1;
+            }
+            (_, Err(e)) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// A one-line description of an op for debug logging — the op kind and the
+/// path it acts on, without dumping the serialized record.
+fn describe(op: &DeployOp) -> String {
+    match op {
+        DeployOp::Mkdir { path } => format!("mkdir {}", path.display()),
+        DeployOp::Backup { from, to } => format!("backup {} -> {}", from.display(), to.display()),
+        DeployOp::Link { source, link } => format!("link {} -> {}", source.display(), link.display()),
+        DeployOp::Copy { source, link } => format!("copy {} -> {}", source.display(), link.display()),
+        DeployOp::RemoveFile { path, .. } => format!("remove {}", path.display()),
+        DeployOp::Restore { backup, to } => format!("restore {} -> {}", backup.display(), to.display()),
+        DeployOp::RemoveDir { path } => format!("rmdir {}", path.display()),
     }
 }
 

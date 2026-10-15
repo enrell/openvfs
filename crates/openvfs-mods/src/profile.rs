@@ -170,16 +170,26 @@ impl Profile {
                     lowers.push(Arc::clone(&fs));
                     mods.push(LoadedMod { name: entry.name.clone(), source_dir: entry.source_dir.clone(), fs });
                 }
-                Err(e) => skipped.push(SkippedMod {
-                    name: entry.name.clone(),
-                    source_dir: entry.source_dir.clone(),
-                    reason: e.to_string(),
-                }),
+                Err(e) => {
+                    log::warn!("skipping mod {:?} ({}): {}", entry.name, entry.source_dir.display(), e);
+                    skipped.push(SkippedMod {
+                        name: entry.name.clone(),
+                        source_dir: entry.source_dir.clone(),
+                        reason: e.to_string(),
+                    });
+                }
             }
         }
         let base: Arc<dyn FileSystem> = Arc::new(PhysicalFs::read_only(&self.game_dir)?);
         lowers.push(Arc::clone(&base));
 
+        log::info!(
+            "profile built: mods={} skipped={} game_dir={} overwrite_dir={}",
+            mods.len(),
+            skipped.len(),
+            self.game_dir.display(),
+            self.overwrite_dir.display()
+        );
         Ok(BuiltProfile { overlay: Arc::new(OverlayFs::with_layers(upper, lowers)), mods, base, skipped })
     }
 

@@ -6,9 +6,13 @@
 mod common;
 
 mod ci;
+mod cli;
 mod conflicts;
 mod deploy;
+mod deploy_faults;
+mod differential_deploy;
 mod index;
+mod priority_prop;
 mod profile;
 mod scaling;
 
