@@ -3,7 +3,42 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project follows
 [SemVer](https://semver.org/).
 
-## [0.1.1] — 2026-10-15
+## [Unreleased]
+
+### Added
+- `VPath::folded()` / `FoldedPath` and `VPath::eq_ignore_case`: Unicode-lowercase keys that compare and hash
+  case-insensitively while the original spelling is preserved for display and file access (`open-vfs`).
+- **`openvfs-mods`** — the mod-management layer:
+  - `MergedIndex`: a snapshot over ordered layers (`layers[0]` wins) keyed by folded path — `Textures/` and
+    `textures/` merge — answering lookups, listings and provenance without touching the file systems; explicit
+    `invalidate`/`rebuild`; ~700 ms over 100 thousand files in 500 layers.
+  - `CaseInsensitiveFs`: a `FileSystem` adapter resolving each component case-insensitively, preserving real casing.
+  - `Profile`: an ordered mod list (enable/disable/reorder, JSON persistence) that assembles an `OverlayFs` with an
+    `overwrite` upper; missing mods are skipped with diagnostics, a missing game directory is an error.
+  - `ConflictReport`: winner + ordered losers for every contested path, with per-mod counts.
+  - `deploy`: plans the diff between the game directory and the merged index, then applies it transactionally —
+    hardlinks with cross-volume copy fallback, a write-ahead JSONL journal (resume/rollback after a crash),
+    a SHA-256 manifest, originals preserved under `backup/` for byte-for-byte `undeploy`, drift detection via
+    `verify`, and `capture` of game writes into the overwrite directory. `PlanOptions::copy_under` for subtrees
+    the game writes in place (see the hardlink caveat in the module docs).
+  - Structured logging via the `log` facade and an `openvfs-mods` CLI: `profile`, `conflicts`, `deploy`,
+    `undeploy`, `verify`, `capture`, `status`, `resume`, `rollback`, `game`.
+- **`openvfs-winfsp`** (Windows): mounts any `FileSystem` through WinFsp, bound dynamically at runtime — no SDK at
+  build time; 20 filesystem callbacks implemented, tests self-skip without the driver.
+- **`openvfs-hook`** (Windows): per-process merged view via Win32 API detours (`ilhook` engine): `CreateFile*`,
+  `Find*`, attributes, delete/rename/copy/move, writes captured to `overwrite`, whiteouts; injector + synthetic
+  game verified end-to-end live. Foundation grade — see `docs/hook-spec.md` for coverage and remaining work.
+- `docs/recovery.md`: journal/manifest layout and recovery procedures for the deployment engine.
+
+### Fixed
+- `openvfs-mods` deploy: a deployed file displacing a *directory* recorded no backup (unrestorable), and a file
+  displaced by a created directory had no manifest entry to hang one on — undeploy now restores both.
+- `openvfs-mods` CLI: profile paths stored relative depended on the caller's CWD; they are absolutized on load.
+
+### Tests
+- Deployment fault injection at every plan position (crash → resume converges / rollback restores), a
+  deployed-vs-virtual differential suite, and randomized priority-ordering properties.
+- 888 tests total.
 
 ### Fixed
 - `PhysicalFs::read_dir` returns entries sorted by name. On Linux and macOS the on-disk order is arbitrary, which made

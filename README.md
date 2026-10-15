@@ -33,7 +33,25 @@ open-vfs = "0.1"   # in code: use openvfs::prelude::*;
 
 Write your functions against `&Vfs` (or `&dyn FileSystem`): the backend becomes the caller's choice, and tests just
 pass `Vfs::memory()`. The crate README ([`crates/openvfs/README.md`](crates/openvfs/README.md)) has a minimal example
-and the limits to know about. `openvfs-sandbox` is only an application (`publish = false`).
+and the limits to know about. The other workspace crates (`openvfs-mods`, `openvfs-winfsp`, `openvfs-hook`,
+`openvfs-sandbox`) are applications/infrastructure (`publish = false`).
+
+## Use case: game mod management
+
+The workspace also contains a complete mod-management pipeline — the result an unmodified game needs is a directory
+that *looks* merged by mod priority without ever touching the originals. Two tracks deliver it:
+
+- **Deployment** ([`openvfs-mods`](crates/openvfs-mods)): profiles (an ordered, JSON-persisted mod list), a
+  case-insensitive merged index (`FoldedPath` makes `Textures/` and `textures/` the same directory), a conflict
+  report, and a **transactional deployer** that plants the winning files into the game directory as hardlinks
+  (copy fallback), journaling every step so a crash mid-deploy can be resumed or rolled back. Game writes are
+  captured into an `overwrite` directory, and `undeploy` restores the game directory byte-for-byte. Ships as a
+  library plus the `openvfs-mods` CLI; see [`docs/recovery.md`](docs/recovery.md).
+- **Real virtualization** ([`openvfs-winfsp`](crates/openvfs-winfsp), Windows): mounts any `FileSystem` as a real
+  drive/directory via [WinFsp](https://winfsp.dev) — bound dynamically at runtime, so no SDK is needed to build.
+- **Per-process interception** ([`openvfs-hook`](crates/openvfs-hook), Windows): a DLL that gives one process a
+  merged view by detouring Win32 file APIs — the mechanism class that tools like Mod Organizer use, built
+  clean-room. Foundation-grade; see [`docs/hook-spec.md`](docs/hook-spec.md) for the coverage matrix and risks.
 
 ## Architecture
 
@@ -97,7 +115,7 @@ cargo test --workspace
 The integration suites form a single binary (`tests/it`), which makes both compiling and running much faster.
 To run just one suite: `cargo test -p open-vfs --test it conformance::` (or `differential::`, `overlay::`, …).
 
-There are **764 tests** (unit, integration, doctests and end-to-end CLI tests), organized in layers:
+There are **888 tests** (unit, integration, doctests and end-to-end CLI tests), organized in layers:
 
 | Suite | What it proves |
 |---|---|
@@ -110,6 +128,9 @@ There are **764 tests** (unit, integration, doctests and end-to-end CLI tests), 
 | [`physical`](crates/openvfs/tests/it/physical.rs) | traversal attacks, device names, case aliases, symlinks and junctions (escapes, dangling, loops), special files |
 | [`memory`](crates/openvfs/tests/it/memory.rs), [`mount`](crates/openvfs/tests/it/mount.rs), [`api`](crates/openvfs/tests/it/api.rs) | quota accounting, handle semantics, mount shadowing, compile-time `Send`/`Sync`, error mapping and `VPath` properties |
 | [`cli`](crates/openvfs-sandbox/tests/cli.rs) | the real binary: exit codes, a dry run that leaves the disk alone, `--apply`, scripts, REPL, ANSI-free output in a pipe |
+| `openvfs-mods` ([`tests/it`](crates/openvfs-mods/tests/it)) | index/profile/conflicts, deploy plan/apply/resume/rollback/undeploy/verify/capture, crash-resume at **every plan step**, a deployed-vs-virtual differential, priority-ordering properties, and the `openvfs-mods` CLI end-to-end |
+| `openvfs-winfsp` ([`tests`](crates/openvfs-winfsp/tests)) | the callback bridge exercised without the driver; real-mount tests self-skip when WinFsp is not installed |
+| `openvfs-hook` ([`tests`](crates/openvfs-hook/tests)) | end-to-end injection: a synthetic game sees the merged view only inside the hooked process (`OPENVFS_HOOK_E2E=1`) |
 
 **Randomized tests are reproducible** (seeded PRNG, no dependencies) and scalable through environment variables:
 
@@ -169,7 +190,8 @@ that has not been measured yet.
 - `OverlayFs::commit` is idempotent but not atomic; a `rename` across mounts is copy + delete.
 - Overlay whiteouts live in memory (`whiteouts()` lets you persist them externally).
 - The virtual model has no symlinks, permissions or extended attributes.
-- Case-insensitive hosts (Windows, macOS) keep that behavior inside `PhysicalFs`.
+- Case-insensitive hosts (Windows, macOS) keep that behavior inside `PhysicalFs`; `FoldedPath` and the
+  `openvfs-mods` index/adapter provide case-insensitive lookup where a mod manager needs it.
 
 ## License
 
