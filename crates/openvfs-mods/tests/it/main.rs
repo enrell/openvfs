@@ -7,6 +7,7 @@ mod common;
 
 mod ci;
 mod conflicts;
+mod deploy;
 mod index;
 mod profile;
 mod scaling;

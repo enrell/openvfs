@@ -145,6 +145,57 @@ pub fn populate_host(root: &Path, tree: &Tree) {
     }
 }
 
+/// Captures a whole host directory into a [`Tree`] — real casing and full
+/// file bytes, so a round trip can be compared byte-for-byte. Symlinks are
+/// skipped (deployment never creates any).
+pub fn host_tree(root: &Path) -> Tree {
+    fn visit(dir: &Path, rel: &str, out: &mut Tree) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("host_tree: read_dir({}): {e}", dir.display())) {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_str().expect("UTF-8 name").to_owned();
+            let path = format!("{rel}/{name}");
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                out.insert(path.clone(), Entry::Dir);
+                visit(&entry.path(), &path, out);
+            } else if file_type.is_file() {
+                out.insert(path, Entry::File(std::fs::read(entry.path()).unwrap()));
+            }
+        }
+    }
+    let mut out = Tree::new();
+    visit(root, "", &mut out);
+    out
+}
+
+/// Asserts `link` and `source` share an inode — writes a probe through
+/// `link` and observes it at `source`. Works on every OS without needing
+/// unstable file-identity APIs; the bytes are restored afterwards, so only
+/// call this on files whose contents may briefly differ (test dirs).
+#[track_caller]
+pub fn assert_hardlinked(link: &Path, source: &Path) {
+    let before = std::fs::read(source).unwrap_or_else(|e| panic!("assert_hardlinked: read({}): {e}", source.display()));
+    std::fs::write(link, b"__openvfs_probe__").unwrap();
+    let through = std::fs::read(source).unwrap();
+    std::fs::write(link, &before).unwrap(); // restore via the link
+    assert_eq!(through, b"__openvfs_probe__", "{} and {} do not share an inode", link.display(), source.display());
+}
+
+/// Asserts `link` and `source` are *different* inodes — a probe written to
+/// `link` does not appear at `source`. The probe is reverted afterwards.
+#[track_caller]
+pub fn assert_not_hardlinked(link: &Path, source: &Path) {
+    let before_link = std::fs::read(link).unwrap();
+    let before_src = std::fs::read(source).unwrap();
+    std::fs::write(link, b"__openvfs_probe__").unwrap();
+    let after = std::fs::read(source).unwrap();
+    std::fs::write(link, &before_link).unwrap();
+    assert_eq!(after, before_src, "{} and {} unexpectedly share an inode", link.display(), source.display());
+}
+
 /// Captures a whole file system using only the trait primitives.
 pub fn snapshot(fs: &dyn FileSystem) -> Tree {
     fn visit(fs: &dyn FileSystem, dir: &VPath, out: &mut Tree) {
