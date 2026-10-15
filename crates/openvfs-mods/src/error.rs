@@ -26,6 +26,13 @@ pub enum Error {
         /// The host path that was expected to be a directory.
         path: PathBuf,
     },
+    /// A deployment precondition failed, or the deployment state (journal,
+    /// manifest) is inconsistent — e.g. an interrupted deploy that must be
+    /// resumed or rolled back first.
+    Deploy {
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -37,6 +44,7 @@ impl fmt::Display for Error {
             Self::MissingDirectory { role, path } => {
                 write!(f, "{role} directory does not exist: {}", path.display())
             }
+            Self::Deploy { reason } => write!(f, "deployment: {reason}"),
         }
     }
 }
@@ -47,7 +55,7 @@ impl std::error::Error for Error {
             Self::Vfs(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::Json(e) => Some(e),
-            Self::MissingDirectory { .. } => None,
+            Self::MissingDirectory { .. } | Self::Deploy { .. } => None,
         }
     }
 }

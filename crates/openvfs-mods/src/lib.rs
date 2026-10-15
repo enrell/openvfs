@@ -14,6 +14,10 @@
 //!   directories, saved as JSON, that assembles into an
 //!   [`OverlayFs`](openvfs::OverlayFs).
 //!
+//! * [`Deployer`] — the deployment engine: diffs the merged tree against the
+//!   real game directory and materializes it with hardlinks/copies, under a
+//!   journaled, resumable, restorable transaction (see [`deploy`]).
+//!
 //! The model is the one popularized by mod-manager tools — priority-ordered
 //! mods whose files merge into a single view, with an *overwrite* directory
 //! capturing every write the game makes — reimplemented clean-room on the
@@ -23,12 +27,18 @@
 
 mod ci;
 mod conflicts;
+pub mod deploy;
 mod error;
 mod index;
 mod profile;
 
 pub use ci::CaseInsensitiveFs;
 pub use conflicts::{ConflictEntry, ConflictReport, FileCount};
+pub use deploy::{
+    CaptureReport, CapturedFile, CorruptedFile, DeployMethod, DeployMode, DeployOp, DeployReport, Deployer,
+    DeploymentPlan, EntryKind, ForeignFile, ForeignPolicy, Journal, JournalRecord, Manifest, ManifestEntry, Mismatch,
+    MismatchKind, PlanOptions, PlannedFile,
+};
 pub use error::{Error, Result};
 pub use index::{IndexEntry, Layer, MergedIndex, Provider};
 pub use profile::{BuiltProfile, LoadedMod, ModEntry, Profile, SkippedMod};
