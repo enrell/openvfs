@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release -p open-vfs --test it -- differential:: overlay:: concurrency::
+      - run: "cargo test --release -p open-vfs --test it -- differential:: overlay:: concurrency::"
         env:
           OPENVFS_DIFF_CASES: "3000"
           OPENVFS_DIFF_STEPS: "200"
