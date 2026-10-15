@@ -526,8 +526,9 @@ impl Planner<'_> {
             None => {}
             Some(node) if node.kind == FileType::Dir => {
                 // A whole directory standing where a file belongs is moved
-                // into backup too (its contents travel with it).
-                self.backup_node(&node);
+                // into backup too (its contents travel with it) — and the
+                // manifest must know, or undeploy could never put it back.
+                backup = Some(self.backup_node(&node));
             }
             Some(node) => {
                 let host = state::host_path(self.game_dir, &node.path);
@@ -621,6 +622,7 @@ impl Planner<'_> {
             .collect();
         self.plan.foreign = foreign;
         if self.options.foreign == ForeignPolicy::Error && !self.plan.foreign.is_empty() {
+            log::info!("plan refused: {} foreign file(s) under --foreign error", self.plan.foreign.len());
             return Err(Error::Deploy {
                 reason: format!("foreign files in game directory: {}", self.plan.foreign.join(", ")),
             });
@@ -657,6 +659,7 @@ impl Planner<'_> {
         self.moved_nodes.insert(node.path.as_str().to_lowercase());
         let rel = self.claim_backup(&node.path);
         let to = self.backup_root.join(rel.trim_start_matches('/'));
+        log::debug!("plan: backup {} -> backup/{rel}", node.path);
         self.plan.ops.push(DeployOp::Backup { from: state::host_path(self.game_dir, &node.path), to });
         rel
     }
@@ -695,6 +698,7 @@ impl Planner<'_> {
             n += 1;
         }
         let to = self.backup_root.join(rel.trim_start_matches('/'));
+        log::debug!("plan: stray {} -> backup/{rel} (preserved, never auto-restored)", node.path);
         self.plan.ops.push(DeployOp::Backup { from: state::host_path(self.game_dir, &node.path), to });
     }
 

@@ -155,6 +155,7 @@ impl Manifest {
         fs::create_dir_all(state_dir)?;
         let path = Self::path(state_dir);
         let tmp = path.with_extension("json.tmp");
+        log::debug!("manifest: writing {} entries to {}", self.entries.len(), path.display());
         {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
@@ -285,6 +286,11 @@ impl Journal {
 
     /// Appends one record, then fsyncs — the "write-ahead" half of the WAL.
     pub fn append(&mut self, record: &JournalRecord) -> Result<()> {
+        match record {
+            JournalRecord::Plan { plan } => log::trace!("journal: plan ops={}", plan.ops.len()),
+            JournalRecord::Pending { seq, .. } => log::trace!("journal: pending seq={seq}"),
+            JournalRecord::Done { seq } => log::trace!("journal: done seq={seq}"),
+        }
         let mut line = serde_json::to_string(record)?;
         line.push('\n');
         self.file.write_all(line.as_bytes())?;
@@ -320,6 +326,7 @@ impl Journal {
                 Err(e) => {
                     // Only the very last record may be torn (crash mid-append).
                     if lines.next().is_none() {
+                        log::warn!("journal: dropping torn last record in {}", path.display());
                         break;
                     }
                     return Err(Error::Deploy { reason: format!("corrupt journal record in {}: {e}", path.display()) });
