@@ -1,118 +1,117 @@
 # openvfs
 
-**Sistema de arquivos virtual (VFS) em camadas para Rust.** Sem dependências externas, `#![forbid(unsafe_code)]`,
-licença MIT.
+**A layered virtual file system (VFS) for Rust.** No external dependencies, `#![forbid(unsafe_code)]`, MIT license.
 
-O openvfs oferece uma única API de arquivos com vários tipos de armazenamento por trás, combináveis entre si: memória,
-disco, montagens e camadas *copy-on-write* com rastreamento de mudanças. Todos os backends passam pela **mesma suíte
-de conformidade e de testes diferenciais**, então o seu código se comporta igual onde quer que os bytes estejam.
+openvfs gives you one file API over interchangeable storage that can be combined freely: memory, disk, mount tables
+and *copy-on-write* layers with change tracking. Every backend passes the **same conformance and differential test
+suites**, so your code behaves the same wherever the bytes live.
 
 ```rust
 use openvfs::prelude::*;
 
 let mounts = MountFs::new();
-mounts.mount("/", MemoryFs::with_quota(64 << 20))?;                       // raiz em RAM, até 64 MiB
-mounts.mount("/assets", ReadOnlyFs::new(PhysicalFs::new("./assets")?))?;  // disco, somente leitura
+mounts.mount("/", MemoryFs::with_quota(64 << 20))?;                       // RAM root, up to 64 MiB
+mounts.mount("/assets", ReadOnlyFs::new(PhysicalFs::new("./assets")?))?;  // host directory, read-only
 
 let vfs = Vfs::new(mounts);
 vfs.create_dir_all("/save/slot1")?;
-vfs.write_atomic("/save/slot1/state.json", r#"{"level": 3}"#)?;          // nunca fica pela metade
+vfs.write_atomic("/save/slot1/state.json", r#"{"level": 3}"#)?;          // never half-written
 let logo = vfs.read("/assets/logo.png")?;
 ```
 
-> Implementação *clean-room*: escrita do zero, sem consultar o código de outros VFS.
+> Clean-room implementation: written from scratch, without consulting the code of other VFS libraries.
 
-## Usar em outros projetos
+## Using it in other projects
 
-A biblioteca é o crate `openvfs` (sem dependências, MSRV 1.88). No `Cargo.toml` do seu projeto:
+The package is published on crates.io as `open-vfs`; the library is imported as `openvfs` (no dependencies, MSRV 1.88).
+In your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-open-vfs = { git = "https://github.com/enrell/openvfs" }   # no código: use openvfs::prelude::*;
+open-vfs = "0.1"   # in code: use openvfs::prelude::*;
 ```
 
-No crates.io: `open-vfs = "0.1"` (o pacote chama-se `open-vfs`; a biblioteca é importada como `openvfs`). Escreva suas funções recebendo `&Vfs` (ou `&dyn FileSystem`):
-o backend vira uma escolha de quem chama, e nos testes basta passar `Vfs::memory()`. O README do crate
-([`crates/openvfs/README.md`](crates/openvfs/README.md)) traz um exemplo mínimo e os limites a conhecer.
-`cargo package -p open-vfs` já valida o pacote; o `openvfs-sandbox` é só uma aplicação (`publish = false`).
+Write your functions against `&Vfs` (or `&dyn FileSystem`): the backend becomes the caller's choice, and tests just
+pass `Vfs::memory()`. The crate README ([`crates/openvfs/README.md`](crates/openvfs/README.md)) has a minimal example
+and the limits to know about. `openvfs-sandbox` is only an application (`publish = false`).
 
-## Arquitetura
+## Architecture
 
 ```
                 ┌───────────────────────────────┐
-  seu código ──▶│ Vfs  (API no estilo std::fs)  │  read, write_atomic, walk, copy_dir_all, try_exists…
+  your code ───▶│ Vfs  (std::fs-style API)      │  read, write_atomic, walk, copy_dir_all, try_exists…
                 └──────────────┬────────────────┘
-                               │ trait FileSystem: 7 primitivas + 2 com implementação padrão
+                               │ trait FileSystem: 7 primitives + 2 with default implementations
        ┌───────────┬───────────┼────────────┬──────────────┐
    MemoryFs    PhysicalFs   ReadOnlyFs    MountFs       OverlayFs
-   RAM, cota,  diretório    wrapper       tabela de     upper gravável sobre
-   operações   confinado,                 montagem      lowers somente leitura,
-   atômicas    política de                              changes / commit / reset
-               links
+   RAM, quota, confined     wrapper       mount         writable upper over
+   atomic      directory,                 table         read-only lowers,
+   operations  link policy                              changes / commit / reset
 ```
 
-| Componente | Garantias |
+| Component | Guarantees |
 |---|---|
-| [`VPath`](crates/openvfs/src/path.rs) | absoluto, normalizado, `..` para na raiz, comparação sensível a maiúsculas |
-| [`VfsError`](crates/openvfs/src/error.rs) | variantes tipadas; **sempre informa o caminho que você passou**; converte para `io::Error` sem perda |
-| [`MemoryFs`](crates/openvfs/src/memory.rs) | toda operação é atômica e linearizável; cota de bytes; handles com semântica de Unix (sobrevivem ao `unlink` e ao rename) |
-| [`PhysicalFs`](crates/openvfs/src/physical.rs) | confinamento contra caminhos hostis, nomes de dispositivo do Windows e symlinks (ver [SECURITY.md](SECURITY.md)) |
-| [`MountFs`](crates/openvfs/src/mount.rs) | vence o prefixo mais longo; os ancestrais das montagens são diretórios virtuais; erros reescritos no caminho externo |
-| [`OverlayFs`](crates/openvfs/src/overlay.rs) | as camadas inferiores nunca são escritas; operações linearizáveis; copy-up atômico; `changes()` exato; `commit` idempotente |
-| [`ops`](crates/openvfs/src/ops.rs) | `write_atomic`, `create_dir_all`, cópia recursiva e `Walk` (ordenado, preguiçoso, com `max_depth` e `filter_entry`) |
+| [`VPath`](crates/openvfs/src/path.rs) | absolute, normalized, `..` stops at the root, case-sensitive comparison |
+| [`VfsError`](crates/openvfs/src/error.rs) | typed variants; **always reports the path you passed**; converts to `io::Error` losslessly |
+| [`MemoryFs`](crates/openvfs/src/memory.rs) | every operation is atomic and linearizable; byte quota; Unix-style handles (they survive `unlink` and rename) |
+| [`PhysicalFs`](crates/openvfs/src/physical.rs) | confinement against hostile paths, Windows device names and symlinks (see [SECURITY.md](SECURITY.md)); listings sorted by name |
+| [`MountFs`](crates/openvfs/src/mount.rs) | longest prefix wins; ancestors of mount points are virtual directories; errors rewritten to the outer path |
+| [`OverlayFs`](crates/openvfs/src/overlay.rs) | lower layers are never written; linearizable operations; atomic copy-up; exact `changes()`; idempotent `commit` |
+| [`ops`](crates/openvfs/src/ops.rs) | `write_atomic`, `create_dir_all`, recursive copy and `Walk` (ordered, lazy, with `max_depth` and `filter_entry`) |
 
-## O contrato
+## The contract
 
-Documentado no trait [`FileSystem`](crates/openvfs/src/fs.rs) e verificado por testes, ponto a ponto:
+Documented on the [`FileSystem`](crates/openvfs/src/fs.rs) trait and verified by tests, point by point:
 
-- `create_dir` e `open(create)` exigem que o pai exista; `remove_dir` só remove diretório vazio; a raiz é intocável.
-- `rename` substitui um arquivo no destino, recusa sobrescrever um diretório e recusa mover um diretório para dentro
-  de si mesmo; renomear algo para o próprio nome não faz nada.
-- `copy_file` recusa copiar um arquivo sobre ele mesmo (em vez de truncá-lo).
-- Um caminho que atravessa um arquivo (`/arq.txt/x`) gera `NotADirectory`; um caminho inexistente gera `NotFound`.
-- A ordem das verificações é a mesma em todos os backends, então o erro reportado também é o mesmo.
+- `create_dir` and `open(create)` require the parent to exist; `remove_dir` only removes an empty directory; the root
+  is untouchable.
+- `rename` replaces a file at the destination, refuses to overwrite a directory, and refuses to move a directory into
+  itself; renaming something to its own name does nothing.
+- `copy_file` refuses to copy a file onto itself (instead of truncating it).
+- A path that goes through a file (`/file.txt/x`) yields `NotADirectory`; a missing path yields `NotFound`.
+- The order of the checks is the same in every backend, so the reported error is the same too.
 
-## Caso de uso: `openvfs-sandbox`
+## Use case: `openvfs-sandbox`
 
-Edite um diretório real com prévia e desfazer garantido. O disco é a camada inferior do overlay, e todas as edições
-ficam em memória até o `commit`.
+Edit a real directory with a preview and a guaranteed undo. The disk is the overlay's lower layer, and all edits stay
+in memory until `commit`.
 
 ```bash
-cargo run -p openvfs-sandbox -- ./meu-projeto -c "replace fetch_user load_user --ext rs; diff"
+cargo run -p openvfs-sandbox -- ./my-project -c "replace fetch_user load_user --ext rs; diff"
 ```
 
 ```bash
-cargo run -p openvfs-sandbox -- ./meu-projeto --apply -f renomear.txt
+cargo run -p openvfs-sandbox -- ./my-project --apply -f rename.txt
 ```
 
-Use `-c`/`-f` para modo lote: sem `--apply` é só uma simulação; qualquer erro aborta sem tocar o disco. Sem argumentos,
-abre um shell interativo. Os comandos são `ls tree cd cat find grep write append mkdir rm mv cp replace status diff commit discard`.
+Use `-c`/`-f` for batch mode: without `--apply` it is only a dry run; any error aborts without touching the disk.
+With no arguments it opens an interactive shell. The commands are
+`ls tree cd cat find grep write append mkdir rm mv cp replace status diff commit discard`.
 
-## Testes
+## Tests
 
 ```bash
 cargo test --workspace
 ```
 
-As suítes de integração formam um único binário (`tests/it`), o que deixa a compilação e a execução bem mais rápidas.
-Para rodar só uma delas: `cargo test -p open-vfs --test it conformance::` (ou `differential::`, `overlay::`, …).
+The integration suites form a single binary (`tests/it`), which makes both compiling and running much faster.
+To run just one suite: `cargo test -p open-vfs --test it conformance::` (or `differential::`, `overlay::`, …).
 
-São **764 testes** (unitários, de integração, doctests e de ponta a ponta do CLI), organizados em camadas:
+There are **764 tests** (unit, integration, doctests and end-to-end CLI tests), organized in layers:
 
-| Suíte | O que prova |
+| Suite | What it proves |
 |---|---|
-| [`conformance`](crates/openvfs/tests/it/conformance.rs) | **56 regras do contrato × 11 configurações** (memória, disco, disco seguindo links, overlay sobre memória, overlay sobre disco, overlay com upper em disco, duas lowers com "iscas", overlay empilhado, montagem, montagem aninhada e um backend mínimo de terceiro que usa as implementações padrão) = 616 testes |
-| [`differential`](crates/openvfs/tests/it/differential.rs) | históricos aleatórios aplicados a um `MemoryFs` de referência e a cada configuração: resultado, **variante do erro e caminho** precisam bater a cada passo; a árvore inteira é comparada periodicamente; as camadas inferiores precisam ficar intactas |
-| [`overlay`](crates/openvfs/tests/it/overlay.rs) | semântica de copy-on-write e propriedades algébricas: `changes()` é exato e bem classificado; `commit` reproduz a visão mesclada; `reset` restaura a original |
-| [`faults`](crates/openvfs/tests/it/faults.rs) | injeção de falhas em **cada ponto possível**, em dois modelos (disco morto e falha transitória): commit retomável, `write_atomic` nunca expõe dados parciais, copy-up e rename nunca corrompem a visão, rollback de rename de diretório |
-| [`concurrency`](crates/openvfs/tests/it/concurrency.rs) | escritores em paralelo, `create_new` exclusivo, `write_atomic` nunca observado pela metade, appends não se perdem, renames atômicos para quem está listando, "tempestade" de mutações no overlay; tudo com watchdog contra deadlock |
-| [`scaling`](crates/openvfs/tests/it/scaling.rs) | contratos de complexidade: listar um diretório não depende do tamanho da subárvore, resolver um caminho não depende do número de montagens; falham se algum deles voltar a ser linear |
-| [`physical`](crates/openvfs/tests/it/physical.rs) | ataques de traversal, nomes de dispositivo, aliases de maiúsculas, symlinks e junctions (fuga, pendentes, loops), arquivos especiais |
-| [`memory`](crates/openvfs/tests/it/memory.rs), [`mount`](crates/openvfs/tests/it/mount.rs), [`api`](crates/openvfs/tests/it/api.rs) | contabilidade da cota, semântica de handles, sombreamento de montagens, `Send`/`Sync` em tempo de compilação, mapeamento de erros e propriedades do `VPath` |
-| [`cli`](crates/openvfs-sandbox/tests/cli.rs) | o binário real: códigos de saída, simulação que não altera o disco, `--apply`, scripts, REPL, saída sem ANSI em pipe |
+| [`conformance`](crates/openvfs/tests/it/conformance.rs) | **56 contract rules × 11 configurations** (memory, disk, disk following links, overlay over memory, overlay over disk, overlay with a disk upper, two lowers with decoys, stacked overlay, mount, nested mount, and a minimal third-party backend that uses the default implementations) = 616 tests |
+| [`differential`](crates/openvfs/tests/it/differential.rs) | random histories applied to a reference `MemoryFs` and to every configuration: the result, **the error variant and the path** must match at every step; the whole tree is compared periodically; lower layers must stay untouched |
+| [`overlay`](crates/openvfs/tests/it/overlay.rs) | copy-on-write semantics and algebraic properties: `changes()` is exact and well classified; `commit` reproduces the merged view; `reset` restores the original |
+| [`faults`](crates/openvfs/tests/it/faults.rs) | fault injection at **every possible point**, in two models (dead disk and transient failure): resumable commit, `write_atomic` never exposes partial data, copy-up and rename never corrupt the view, directory-rename rollback |
+| [`concurrency`](crates/openvfs/tests/it/concurrency.rs) | parallel writers, exclusive `create_new`, `write_atomic` never observed half-done, appends are not lost, renames are atomic to listers, an overlay mutation "storm"; all under a deadlock watchdog |
+| [`scaling`](crates/openvfs/tests/it/scaling.rs) | complexity contracts: listing a directory does not depend on the size of its subtree, resolving a path does not depend on the number of mounts; they fail if either becomes linear again |
+| [`physical`](crates/openvfs/tests/it/physical.rs) | traversal attacks, device names, case aliases, symlinks and junctions (escapes, dangling, loops), special files |
+| [`memory`](crates/openvfs/tests/it/memory.rs), [`mount`](crates/openvfs/tests/it/mount.rs), [`api`](crates/openvfs/tests/it/api.rs) | quota accounting, handle semantics, mount shadowing, compile-time `Send`/`Sync`, error mapping and `VPath` properties |
+| [`cli`](crates/openvfs-sandbox/tests/cli.rs) | the real binary: exit codes, a dry run that leaves the disk alone, `--apply`, scripts, REPL, ANSI-free output in a pipe |
 
-**Os testes aleatórios são reproduzíveis** (PRNG com semente, sem dependências) e escaláveis por variáveis de
-ambiente:
+**Randomized tests are reproducible** (seeded PRNG, no dependencies) and scalable through environment variables:
 
 ```bash
 OPENVFS_DIFF_CASES=3000 OPENVFS_DIFF_STEPS=200 OPENVFS_PROP_CASES=3000 cargo test --release -p open-vfs
@@ -122,54 +121,56 @@ OPENVFS_DIFF_CASES=3000 OPENVFS_DIFF_STEPS=200 OPENVFS_PROP_CASES=3000 cargo tes
 OPENVFS_DIFF_SEED=1592590357 cargo test -p open-vfs --test it differential::
 ```
 
-`OPENVFS_DIFF_THREADS` controla quantas threads dividem os históricos de cada backend (padrão: núcleos, até 8).
+`OPENVFS_DIFF_THREADS` controls how many threads share each backend's histories (default: cores, at most 8).
 
-Um teste preso (deadlock) não trava a execução: os testes concorrentes têm watchdog próprio e o processo inteiro aborta
-após `OPENVFS_TEST_DEADLINE_SECS` segundos (padrão 180; aumente nas execuções com `OPENVFS_DIFF_CASES` grande).
+A stuck test (deadlock) does not hang the run: the concurrent tests have their own watchdog and the whole process
+aborts after `OPENVFS_TEST_DEADLINE_SECS` seconds (default 180; raise it for runs with a large `OPENVFS_DIFF_CASES`).
 
-A CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) roda fmt, clippy pedântico e rustdoc com
-`-D warnings`, testes em Linux, macOS e Windows, a MSRV (1.88) e uma execução profunda noturna dos testes aleatórios.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs fmt, pedantic clippy and rustdoc with `-D warnings`,
+the tests on Linux, macOS and Windows, the MSRV (1.88), and a nightly deep run of the randomized tests. Tagging `v*`
+runs the [release workflow](.github/workflows/release.yml).
 
-## Desempenho
+## Performance
 
-O custo de cada operação, com *n* nós, *c* filhos, *d* componentes no caminho e *m* montagens:
+The cost of each operation, with *n* nodes, *c* children, *d* components in the path and *m* mounts:
 
-| Backend | Operação | Custo |
+| Backend | Operation | Cost |
 |---|---|---|
-| `MemoryFs` | `metadata`, `open`, `create_dir`, `remove_*` de um nó | O(log n) |
-| `MemoryFs` | `read_dir` | O(c · log n), **independe** do que há abaixo dos filhos |
-| `MemoryFs` | `rename` / `remove_dir_all` de um diretório | O(nós na subárvore) |
-| `MountFs` | resolver um caminho | O(d · log m), **independe** de quantas montagens existem |
-| `OverlayFs` | leituras | concorrentes (lock de leitura); o custo é o da camada que responde |
-| `OverlayFs` | operações estruturais (`rename`, `remove`, copy-up) | serializadas por um lock global |
-| `PhysicalFs` | qualquer operação, `Symlinks::Deny` | ~*d* chamadas de sistema (uma `lstat` por componente) |
-| `PhysicalFs` | qualquer operação, `FollowWithinRoot` | tipicamente uma `canonicalize` |
+| `MemoryFs` | `metadata`, `open`, `create_dir`, `remove_*` of one node | O(log n) |
+| `MemoryFs` | `read_dir` | O(c · log n), **independent** of what lies below the children |
+| `MemoryFs` | `rename` / `remove_dir_all` of a directory | O(nodes in the subtree) |
+| `MountFs` | resolving a path | O(d · log m), **independent** of how many mounts exist |
+| `OverlayFs` | reads | concurrent (read lock); the cost is that of the layer that answers |
+| `OverlayFs` | structural operations (`rename`, `remove`, copy-up) | serialized by one global lock |
+| `PhysicalFs` | any operation, `Symlinks::Deny` | ~*d* system calls (one `lstat` per component) |
+| `PhysicalFs` | any operation, `FollowWithinRoot` | typically one `canonicalize` |
 
-Os contratos em **negrito** são verificados por [`tests/it/scaling.rs`](crates/openvfs/tests/it/scaling.rs). Para números na
-sua máquina (varia muito com o disco e com antivírus):
+The **independent** claims are checked by [`tests/it/scaling.rs`](crates/openvfs/tests/it/scaling.rs). For numbers on
+your machine (they vary a lot with the disk and antivirus):
 
 ```bash
 cargo run --release -p open-vfs --example bench
 ```
 
-Medido num Windows 11, uma máquina, ruído de até 2×: `MemoryFs::read_dir("/")` com dois filhos custava 18 µs com 1 mil
-nós abaixo e **1,8 ms** com 100 mil; agora custa ~2–5 µs nos dois casos. `MountFs::metadata` com 1024 montagens caiu de
-9 µs para ~1,7 µs, praticamente o custo de uma única montagem. No `PhysicalFs` o custo é dominado pelas chamadas de sistema:
-nessa máquina cada uma custa ~16 µs, então `metadata` a 8 níveis de profundidade leva ~160 µs contra ~30 µs do
-`std::fs`. Em Linux, onde uma chamada de sistema custa ~1 µs, a diferença é bem menor, mas isso ainda não foi medido.
+Measured on one Windows 11 machine, with noise of up to 2×: `MemoryFs::read_dir("/")` with two children used to cost
+18 µs with 1 thousand nodes below and **1.8 ms** with 100 thousand; it now costs ~2–5 µs in both cases.
+`MountFs::metadata` with 1024 mounts dropped from 9 µs to ~1.7 µs, practically the cost of a single mount. In
+`PhysicalFs` the cost is dominated by system calls: on that machine each one costs ~16 µs, so `metadata` 8 levels deep
+takes ~160 µs against ~30 µs for `std::fs`. On Linux, where a system call costs ~1 µs, the gap is much smaller, but
+that has not been measured yet.
 
-## Limitações conhecidas
+## Known limitations
 
-- Não é uma fronteira contra processos hostis *concorrentes* no host (TOCTOU). Ver [SECURITY.md](SECURITY.md).
-- `PhysicalFs` com `Symlinks::Deny` paga uma chamada de sistema por componente do caminho; em árvores muito
-  profundas e acessadas com frequência isso é o gargalo (ver [Desempenho](#desempenho)).
-- `MemoryFs::rename` e `remove_dir_all` de um diretório custam proporcionalmente ao tamanho da subárvore.
-- `read_dir` devolve um `Vec` completo; não há listagem em streaming nem API assíncrona.
-- `OverlayFs::commit` é idempotente, mas não atômico; um `rename` entre montagens é copiar + apagar.
-- Os whiteouts do overlay vivem em memória (`whiteouts()` permite persisti-los por fora).
-- O modelo virtual não tem symlinks, permissões nem atributos estendidos.
-- Hosts que não diferenciam maiúsculas (Windows, macOS) mantêm essa semântica dentro do `PhysicalFs`.
+- It is not a boundary against *concurrent* hostile processes on the host (TOCTOU). See [SECURITY.md](SECURITY.md).
+- `PhysicalFs` with `Symlinks::Deny` pays one system call per path component; in very deep, frequently accessed trees
+  this is the bottleneck (see [Performance](#performance)).
+- `MemoryFs::rename` and `remove_dir_all` of a directory cost proportionally to the size of the subtree.
+- `read_dir` returns a complete `Vec`; there is no streaming listing and no async API.
+- `OverlayFs::commit` is idempotent but not atomic; a `rename` across mounts is copy + delete.
+- Overlay whiteouts live in memory (`whiteouts()` lets you persist them externally).
+- The virtual model has no symlinks, permissions or extended attributes.
+- Case-insensitive hosts (Windows, macOS) keep that behavior inside `PhysicalFs`.
 
-## Licença
+## License
 
 [MIT](LICENSE).

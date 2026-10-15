@@ -21,7 +21,7 @@ fn main() -> openvfs::Result<()> {
 
     // Plain std-like calls...
     vfs.create_dir_all("/tmp/reports")?;
-    vfs.write("/tmp/reports/hello.txt", "olá do VFS!\n")?;
+    vfs.write("/tmp/reports/hello.txt", "hello from the VFS!\n")?;
     println!("{}", vfs.read_to_string("/tmp/reports/hello.txt")?.trim_end());
 
     // ...and handles are ordinary `std::io` objects.

@@ -1,44 +1,45 @@
-# Segurança e modelo de ameaças
+# Security and threat model
 
-## O que o openvfs garante
+## What openvfs guarantees
 
-**Caminhos não escapam da raiz.** Todo caminho passa por `VPath`, que normaliza a entrada e resolve `..`
-lexicalmente, sempre parando na raiz. Os backends nunca recebem um `..`.
+**Paths do not escape the root.** Every path goes through `VPath`, which normalizes the input and resolves `..`
+lexically, always stopping at the root. Backends never receive a `..`.
 
-**`PhysicalFs` confina caminhos hostis à pasta-raiz:**
+**`PhysicalFs` confines hostile paths to its root directory:**
 
-| Ataque | Defesa | Teste |
+| Attack | Defense | Test |
 |---|---|---|
-| `../../etc/passwd`, `\..\x` | `VPath` limita na raiz | `physical::traversal_never_leaves_the_root` |
-| `C:\…`, `\\?\…` (prefixos) | componente precisa ser um único `Normal` | `physical::windows_device_names_and_aliases_are_rejected` |
-| `CON`, `NUL.txt`, `COM1`, `LPT¹` (dispositivos Windows) | rejeitados com `InvalidPath` | idem + teste unitário `windows_name_rules` |
-| `arquivo.txt:stream` (NTFS ADS), `<>:"\|?*` | rejeitados | idem |
-| `nome.` / `nome ` (o Windows remove e cria um alias) | rejeitados | idem |
-| symlink/junction apontando para fora | `Symlinks::Deny` (padrão): `PermissionDenied`; `FollowWithinRoot`: `PathEscapesRoot` | `physical::deny_policy_…`, `physical::follow_policy_…` |
-| symlink pendente (criaria o arquivo fora) | tratado como fuga | idem |
-| loop de symlinks (`loop -> .`) | `Deny`: invisível; `Follow`: use `Walk::max_depth` | idem |
-| `remove_dir_all` em pasta que contém link | remove o link, nunca o alvo (`std::fs::remove_dir_all`) | `recursive_delete_removes_links_not_targets` |
-| FIFO, socket, dispositivo dentro da raiz | invisíveis (abrir um FIFO bloquearia) | `special_files_and_unaddressable_names_are_invisible` (Unix) |
+| `../../etc/passwd`, `\..\x` | `VPath` clamps at the root | `physical::traversal_never_leaves_the_root` |
+| `C:\…`, `\\?\…` (prefixes) | a component must be a single `Normal` | `physical::windows_device_names_and_aliases_are_rejected` |
+| `CON`, `NUL.txt`, `COM1`, `LPT¹` (Windows devices) | rejected with `InvalidPath` | same + unit test `windows_name_rules` |
+| `file.txt:stream` (NTFS ADS), `<>:"\|?*` | rejected | same |
+| `name.` / `name ` (Windows strips these and creates an alias) | rejected | same |
+| symlink/junction pointing outside | `Symlinks::Deny` (default): `PermissionDenied`; `FollowWithinRoot`: `PathEscapesRoot` | `physical::deny_policy_…`, `physical::follow_policy_…` |
+| dangling symlink (would create the file outside) | treated as an escape | same |
+| symlink loop (`loop -> .`) | `Deny`: invisible; `Follow`: use `Walk::max_depth` | same |
+| `remove_dir_all` on a directory containing a link | removes the link, never the target (`std::fs::remove_dir_all`) | `recursive_delete_removes_links_not_targets` |
+| FIFO, socket, device inside the root | invisible (opening a FIFO would block) | `special_files_and_unaddressable_names_are_invisible` (Unix) |
 
-**Memória limitada para entradas não confiáveis.** `MemoryFs::with_quota(bytes)` limita o total de bytes. Isso vale
-para escrita, append, `set_len`, cópia e escrita esparsa. Ao estourar a cota, a operação falha com `StorageFull`.
+**Bounded memory for untrusted input.** `MemoryFs::with_quota(bytes)` caps the total number of bytes. This applies to
+writes, appends, `set_len`, copies and sparse writes. When the quota is exceeded the operation fails with
+`StorageFull`.
 
-**Nenhuma perda silenciosa de dados.** Copiar um arquivo sobre ele mesmo é recusado; antes, isso o truncava. No
-overlay, copy-up e rename gravam em um nome temporário e fazem `rename` atômico para o lugar, então uma falha nunca
-deixa um arquivo parcial no caminho real.
+**No silent data loss.** Copying a file onto itself is refused; it used to truncate it. In the overlay, copy-up and
+rename write to a temporary name and then atomically `rename` into place, so a failure never leaves a partial file at
+the real path.
 
-## O que o openvfs **não** garante
+## What openvfs does **not** guarantee
 
-- **TOCTOU no host.** O confinamento do `PhysicalFs` vale para *caminhos*. Um processo hostil e concorrente que troque
-  pastas por symlinks entre a verificação e o uso pode vencer a corrida. Se esse é o seu modelo de ameaça, combine
-  com isolamento do SO (containers, namespaces, AppContainer, contas sem privilégio).
-- **Permissões e ACLs.** O modelo virtual não tem dono nem modo de acesso. `PhysicalFs` opera com os direitos do
-  processo.
-- **Atomicidade entre camadas.** `OverlayFs::commit` é idempotente, mas não atômico. `Vfs::rename` entre montagens é
-  copiar + apagar.
-- **Durabilidade de diretório.** `write_atomic` faz `sync_all` do arquivo, mas não do diretório pai.
+- **TOCTOU on the host.** `PhysicalFs` confinement applies to *paths*. A hostile concurrent process that swaps
+  directories for symlinks between the check and the use can win the race. If that is your threat model, combine it
+  with OS isolation (containers, namespaces, AppContainer, unprivileged accounts).
+- **Permissions and ACLs.** The virtual model has no owner or access mode. `PhysicalFs` operates with the process's
+  rights.
+- **Atomicity across layers.** `OverlayFs::commit` is idempotent but not atomic. `Vfs::rename` across mounts is
+  copy + delete.
+- **Directory durability.** `write_atomic` calls `sync_all` on the file, but not on the parent directory.
 
-## Reportando vulnerabilidades
+## Reporting vulnerabilities
 
-Abra um relatório privado no repositório (Security Advisories), sem issue pública. Inclua um caso que reproduza o
-problema; o ideal é um teste no formato de `crates/openvfs/tests/it/physical.rs`.
+Open a private report on the repository (Security Advisories), not a public issue. Include a case that reproduces the
+problem; ideally a test in the format of `crates/openvfs/tests/it/physical.rs`.
