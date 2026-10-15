@@ -1,0 +1,44 @@
+name: Release
+
+# Push a tag like `v0.1.2` (after bumping the version and CHANGELOG) to cut a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Tag matches the crate version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"name":"open-vfs","version":"\([^"]*\)".*/\1/p')
+          test "$crate" = "$version" || { echo "tag $version != crate $crate"; exit 1; }
+
+      - name: Test
+        run: cargo test --workspace
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## \[" v "\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG entry for $version"; exit 1; }
+
+      - name: GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --title "open-vfs $GITHUB_REF_NAME" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish to crates.io (only if the CARGO_REGISTRY_TOKEN secret is set)
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then cargo publish -p open-vfs; else echo "no token: skipping crates.io"; fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
