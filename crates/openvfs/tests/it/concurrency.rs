@@ -351,6 +351,9 @@ fn overlay_listings_never_observe_half_applied_changes() {
                     let names: Vec<String> = vfs.read_dir("/").unwrap().into_iter().map(|e| e.name).collect();
                     assert_eq!(names.len(), 1, "observed a half-applied change: {names:?}");
                     checks.fetch_add(1, Ordering::Relaxed);
+                    // Listings hold the read lock for milliseconds: yield, or on a reader-preferring RwLock
+                    // (macOS, older Linux std) the writer below never gets in. Fairness is the OS's business.
+                    thread::sleep(Duration::from_millis(1));
                 }
             })
         };
