@@ -221,7 +221,7 @@ fn special_files_and_unaddressable_names_are_invisible() {
     use std::os::unix::ffi::OsStrExt;
     let (dir, vfs) = host("host-special");
     // macOS refuses non-UTF-8 names; where creating one fails there is simply nothing to hide.
-    let _ = std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"badÿutf8")), "x");
+    let _ = std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xffutf8")), "x");
     std::fs::write(dir.path().join(r"back\slash"), "x").unwrap();
     std::fs::write(dir.path().join("ok.txt"), "x").unwrap();
     let fifo = dir.path().join("pipe");
