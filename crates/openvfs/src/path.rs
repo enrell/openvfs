@@ -1,7 +1,9 @@
 //! Normalized, backend-independent virtual paths.
 
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use crate::error::{Result, VfsError};
@@ -160,6 +162,30 @@ impl VPath {
         std::iter::successors(Some(self.clone()), Self::parent)
     }
 
+    /// The case-folded form of this path: the key under which `/Textures/A.dds`
+    /// and `/textures/a.dds` are the same file. See [`FoldedPath`] for the
+    /// exact folding rules.
+    #[must_use]
+    pub fn folded(&self) -> FoldedPath {
+        FoldedPath { original: self.clone(), folded: self.0.to_lowercase() }
+    }
+
+    /// Case-insensitive equality, folded with [`str::to_lowercase`] exactly
+    /// as [`VPath::folded`] does.
+    ///
+    /// ```
+    /// use openvfs::VPath;
+    ///
+    /// let a = VPath::new("/Textures/A.dds").unwrap();
+    /// let b = VPath::new("/textures/a.dds").unwrap();
+    /// assert!(a != b); // plain `VPath` comparison stays case-sensitive
+    /// assert!(a.eq_ignore_case(&b));
+    /// ```
+    #[must_use]
+    pub fn eq_ignore_case(&self, other: &Self) -> bool {
+        self == other || self.0.to_lowercase() == other.0.to_lowercase()
+    }
+
     /// Appends a single, already valid component.
     pub(crate) fn child(&self, name: &str) -> Self {
         debug_assert!(
@@ -269,6 +295,138 @@ impl PartialEq<str> for VPath {
 impl PartialEq<&str> for VPath {
     fn eq(&self, other: &&str) -> bool {
         self.0 == *other
+    }
+}
+
+/// A [`VPath`] pre-folded for case-insensitive comparison, from [`VPath::folded`].
+///
+/// The folded form is [`str::to_lowercase`] applied to the whole path — a
+/// Unicode-aware lowercase, not ASCII-only and not a full Unicode case-fold:
+///
+/// * `"/Textures/A.DDS"` and `"/textures/a.dds"` compare equal;
+/// * `"Ä"` folds to `"ä"`, so `"/ÄNDER"` matches `"/änder"`;
+/// * `"ß"` stays `"ß"` (it does *not* become `"ss"`), so `"/STRÄSSE"` and
+///   `"/sträße"` still differ.
+///
+/// No character ever folds to `/`, `\`, NUL or a `.`/`..` component, so the
+/// folded form keeps every `VPath` invariant — and since folding cannot move
+/// a name across components, paths that fold equal differ only in letter case.
+///
+/// `Eq`, `Hash`, `Ord`, [`FoldedPath::as_str`] and `Borrow<str>` all use the
+/// folded form (so a map keyed by `FoldedPath` can be queried with an
+/// already-folded `&str`), while the original spelling is preserved for
+/// display and for addressing the real file: [`fmt::Display`] prints it and
+/// [`FoldedPath::path`] returns it.
+///
+/// ```
+/// use openvfs::{FoldedPath, VPath};
+/// use std::collections::BTreeMap;
+///
+/// let mut by_folded = BTreeMap::new();
+/// by_folded.insert(VPath::new("/Textures/A.dds").unwrap().folded(), "high-res");
+/// assert_eq!(by_folded.get("/textures/a.dds"), Some(&"high-res"));
+/// ```
+#[derive(Clone)]
+pub struct FoldedPath {
+    /// The path as written, for display and for addressing the real file.
+    original: VPath,
+    /// `original` lowercased; the one identity `Eq`/`Hash`/`Ord` compare.
+    folded: String,
+}
+
+impl FoldedPath {
+    /// Parses `path` as a [`VPath`], then folds it.
+    ///
+    /// # Errors
+    ///
+    /// [`VfsError::InvalidPath`] if the path contains a NUL byte.
+    pub fn new(path: impl AsRef<str>) -> Result<Self> {
+        Ok(VPath::new(path)?.folded())
+    }
+
+    /// The folded form — what `Eq`, `Hash`, `Ord` and `Borrow<str>` see.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.folded
+    }
+
+    /// The original spelling, as a path.
+    #[must_use]
+    pub fn path(&self) -> &VPath {
+        &self.original
+    }
+
+    /// The original spelling, consuming the wrapper.
+    #[must_use]
+    pub fn into_path(self) -> VPath {
+        self.original
+    }
+}
+
+impl fmt::Display for FoldedPath {
+    /// Prints the *original* spelling, exactly as [`VPath`]'s `Display` does.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.original, f)
+    }
+}
+
+impl fmt::Debug for FoldedPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FoldedPath").field(&self.folded).finish()
+    }
+}
+
+impl AsRef<str> for FoldedPath {
+    /// The folded form, like [`FoldedPath::as_str`].
+    fn as_ref(&self) -> &str {
+        &self.folded
+    }
+}
+
+/// Lets maps keyed by `FoldedPath` be queried with an *already folded* `&str`.
+/// Sound because `Eq`, `Ord` and `Hash` all derive from the folded string.
+impl Borrow<str> for FoldedPath {
+    fn borrow(&self) -> &str {
+        &self.folded
+    }
+}
+
+impl From<VPath> for FoldedPath {
+    fn from(path: VPath) -> Self {
+        path.folded()
+    }
+}
+
+impl From<FoldedPath> for VPath {
+    fn from(folded: FoldedPath) -> Self {
+        folded.original
+    }
+}
+
+/// Identity is the folded form only: `"/A"` and `"/a"` are the same key.
+impl PartialEq for FoldedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.folded == other.folded
+    }
+}
+
+impl Eq for FoldedPath {}
+
+impl Hash for FoldedPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.folded.hash(state);
+    }
+}
+
+impl Ord for FoldedPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.folded.cmp(&other.folded)
+    }
+}
+
+impl PartialOrd for FoldedPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -396,5 +554,62 @@ mod tests {
         map.insert(p("/k"), 1);
         assert_eq!(map.get("/k"), Some(&1));
         assert_eq!(String::from(p("/s")), "/s");
+    }
+
+    #[test]
+    fn folded_equality_ignores_case() {
+        assert_eq!(p("/Textures/A.dds").folded(), p("/textures/a.dds").folded());
+        assert_eq!(p("/A").folded(), FoldedPath::new("a").unwrap());
+        assert_ne!(p("/a").folded(), p("/b").folded());
+        assert_ne!(p("/a/x").folded(), p("/a-x").folded());
+        assert!(p("/MiXeD/CaSe").eq_ignore_case(&p("/mixed/case")));
+        assert!(!p("/mixed/case").eq_ignore_case(&p("/mixed/other")));
+    }
+
+    #[test]
+    fn folded_keeps_the_original_spelling() {
+        let folded = p("/Textures/A.DDS").folded();
+        assert_eq!(folded.as_str(), "/textures/a.dds");
+        assert_eq!(folded.path(), &p("/Textures/A.DDS"));
+        assert_eq!(folded.to_string(), "/Textures/A.DDS");
+        assert_eq!(format!("{folded:?}"), r#"FoldedPath("/textures/a.dds")"#);
+        assert_eq!(folded.clone().into_path(), p("/Textures/A.DDS"));
+        assert_eq!(VPath::from(p("/x/Y").folded()), "/x/Y");
+    }
+
+    #[test]
+    fn folded_uses_unicode_lowercase() {
+        // `str::to_lowercase`, not `to_ascii_lowercase`: Ä folds to ä.
+        assert_eq!(p("/ÄNDER").folded(), p("/änder").folded());
+        // …but it is not a full Unicode case-fold: ß stays ß, it does not
+        // become "ss", so these two remain different paths.
+        assert_ne!(p("/STRÄSSE").folded(), p("/sträße").folded());
+        assert_eq!(p("/STRÄSSE").folded().as_str(), "/strässe");
+    }
+
+    #[test]
+    fn folded_orders_and_hashes_by_the_folded_form() {
+        use std::collections::{BTreeMap, HashMap};
+        let mut sorted = [p("/b").folded(), p("/C").folded(), p("/a").folded()];
+        sorted.sort();
+        assert_eq!(sorted, [p("/A").folded(), p("/B").folded(), p("/c").folded()]);
+
+        let mut map = HashMap::new();
+        map.insert(p("/K").folded(), 1);
+        map.insert(p("/k").folded(), 2);
+        assert_eq!(map.len(), 1, "folded twins must share one slot");
+        assert_eq!(map["/k"], 2, "…and are queried with the folded key");
+
+        let mut map = BTreeMap::new();
+        map.insert(p("/K").folded(), 1);
+        assert_eq!(map.get("/k"), Some(&1));
+    }
+
+    #[test]
+    fn folded_form_is_itself_a_valid_path() {
+        for raw in ["/", "/a b/c", "/ão/日本語/FILE.TXT", "/.Hidden", "/a..b"] {
+            let folded = p(raw).folded();
+            assert_eq!(p(folded.as_str()), folded.as_str());
+        }
     }
 }
