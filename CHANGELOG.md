@@ -47,7 +47,7 @@ Primeira versão sob o nome **openvfs** (antes era um protótipo chamado "strata
 
 ### Tempo dos testes
 - Os 10 arquivos de teste de integração viraram **um só binário** (`tests/it/main.rs`; rode uma suíte com
-  `cargo test -p openvfs --test it differential::`). Antes eram 10 executáveis: cada um recompilava `common/`, vinculava
+  `cargo test -p open-vfs --test it differential::`). Antes eram 10 executáveis: cada um recompilava `common/`, vinculava
   separado e pagava a varredura do antivírus na primeira execução. Medido no Windows: recompilar após editar o código
   caiu de ~17 s para ~2 s, as suítes passaram de ~8 s em sequência para ~2 s em paralelo, e o ciclo completo de
   `cargo test --workspace` de ~25 s para ~10 s.

@@ -9,7 +9,7 @@ the bytes live. Files are plain `Read + Write + Seek` objects.
 
 ```toml
 [dependencies]
-openvfs = "0.1"   # or: openvfs = { path = "../openvfs" } / { git = "https://github.com/enrell/openvfs" }
+open-vfs = "0.1"   # the library is imported as `openvfs`: use openvfs::prelude::*;
 ```
 
 ```rust

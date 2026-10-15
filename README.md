@@ -28,13 +28,13 @@ A biblioteca é o crate `openvfs` (sem dependências, MSRV 1.88). No `Cargo.toml
 
 ```toml
 [dependencies]
-openvfs = { path = "../openvfs/crates/openvfs" }   # ou { git = "https://github.com/enrell/openvfs" }
+open-vfs = { git = "https://github.com/enrell/openvfs" }   # no código: use openvfs::prelude::*;
 ```
 
-Depois de publicar no crates.io: `openvfs = "0.1"`. Escreva suas funções recebendo `&Vfs` (ou `&dyn FileSystem`):
+No crates.io: `open-vfs = "0.1"` (o pacote chama-se `open-vfs`; a biblioteca é importada como `openvfs`). Escreva suas funções recebendo `&Vfs` (ou `&dyn FileSystem`):
 o backend vira uma escolha de quem chama, e nos testes basta passar `Vfs::memory()`. O README do crate
 ([`crates/openvfs/README.md`](crates/openvfs/README.md)) traz um exemplo mínimo e os limites a conhecer.
-`cargo package -p openvfs` já valida o pacote; o `openvfs-sandbox` é só uma aplicação (`publish = false`).
+`cargo package -p open-vfs` já valida o pacote; o `openvfs-sandbox` é só uma aplicação (`publish = false`).
 
 ## Arquitetura
 
@@ -95,7 +95,7 @@ cargo test --workspace
 ```
 
 As suítes de integração formam um único binário (`tests/it`), o que deixa a compilação e a execução bem mais rápidas.
-Para rodar só uma delas: `cargo test -p openvfs --test it conformance::` (ou `differential::`, `overlay::`, …).
+Para rodar só uma delas: `cargo test -p open-vfs --test it conformance::` (ou `differential::`, `overlay::`, …).
 
 São **764 testes** (unitários, de integração, doctests e de ponta a ponta do CLI), organizados em camadas:
 
@@ -115,11 +115,11 @@ São **764 testes** (unitários, de integração, doctests e de ponta a ponta do
 ambiente:
 
 ```bash
-OPENVFS_DIFF_CASES=3000 OPENVFS_DIFF_STEPS=200 OPENVFS_PROP_CASES=3000 cargo test --release -p openvfs
+OPENVFS_DIFF_CASES=3000 OPENVFS_DIFF_STEPS=200 OPENVFS_PROP_CASES=3000 cargo test --release -p open-vfs
 ```
 
 ```bash
-OPENVFS_DIFF_SEED=1592590357 cargo test -p openvfs --test it differential::
+OPENVFS_DIFF_SEED=1592590357 cargo test -p open-vfs --test it differential::
 ```
 
 `OPENVFS_DIFF_THREADS` controla quantas threads dividem os históricos de cada backend (padrão: núcleos, até 8).
@@ -149,7 +149,7 @@ Os contratos em **negrito** são verificados por [`tests/it/scaling.rs`](crates/
 sua máquina (varia muito com o disco e com antivírus):
 
 ```bash
-cargo run --release -p openvfs --example bench
+cargo run --release -p open-vfs --example bench
 ```
 
 Medido num Windows 11, uma máquina, ruído de até 2×: `MemoryFs::read_dir("/")` com dois filhos custava 18 µs com 1 mil

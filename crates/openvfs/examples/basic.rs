@@ -1,6 +1,6 @@
 //! MVP tour: in-memory storage, a host directory, a mount table, `std::io` interop.
 //!
-//! Run with: `cargo run -p openvfs --example basic`
+//! Run with: `cargo run -p open-vfs --example basic`
 
 use std::io::{BufRead, BufReader, Write};
 

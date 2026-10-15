@@ -1,8 +1,8 @@
 //! Dependency-free micro-benchmarks for the hot paths of every backend.
 //!
 //! ```text
-//! cargo run --release -p openvfs --example bench
-//! OPENVFS_BENCH_FILTER=mount cargo run --release -p openvfs --example bench
+//! cargo run --release -p open-vfs --example bench
+//! OPENVFS_BENCH_FILTER=mount cargo run --release -p open-vfs --example bench
 //! ```
 //!
 //! Each case reports the **median** and the **best** of ten timed batches, in microseconds per

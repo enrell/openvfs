@@ -1,5 +1,5 @@
 [package]
-name = "openvfs"
+name = "open-vfs"
 description = "A layered, pluggable virtual file system: in-memory, host-backed, mount tables and copy-on-write overlays."
 version.workspace = true
 edition.workspace = true
@@ -16,3 +16,7 @@ categories = ["filesystem"]
 
 [lints]
 workspace = true
+
+[lib]
+# The package is `open-vfs`; code keeps writing `use openvfs::...`.
+name = "openvfs"

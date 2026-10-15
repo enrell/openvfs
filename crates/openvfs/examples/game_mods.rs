@@ -1,6 +1,6 @@
 //! Layered game assets: base game < mods (by priority) < player saves.
 //!
-//! Run with: `cargo run -p openvfs --example game_mods`
+//! Run with: `cargo run -p open-vfs --example game_mods`
 
 use std::sync::Arc;
 
