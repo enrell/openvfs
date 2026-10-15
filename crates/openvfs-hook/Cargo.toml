@@ -1,0 +1,51 @@
+[package]
+name = "openvfs-hook"
+description = "Windows per-process file virtualization via API interception: merged mod layers, overwrite capture, virtualized enumeration."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "openvfs_hook"
+# cdylib: the injectable DLL. rlib: lets tests and tools link the library crate.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "openvfs-inject"
+path = "src/bin/inject.rs"
+
+[[bin]]
+name = "synth-game"
+path = "src/bin/synth_game.rs"
+
+# NOTE: this crate deliberately does NOT opt into `[lints] workspace = true`.
+# The workspace forbids `unsafe_code`, but API interception is impossible
+# without unsafe code (FFI calls into Win32, inline detouring of foreign code).
+# Unsafe is instead concentrated in `engine`/`sys` and audited with
+# `// SAFETY:` comments; the crate uses `#![deny(unsafe_op_in_unsafe_fn)]`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.154"
+# Inline-detour engine. ilhook is pure Rust (iced-x86 disassembler), x64,
+# actively maintained; alternatives considered: retour (needs the C udis86
+# library) and detour (unmaintained since 2019).
+ilhook = "=2.3.0"
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "=3.27.0"
+serde_json = "=1.0.154"
