@@ -1,0 +1,20 @@
+[package]
+name = "openvfs-sandbox"
+description = "Edit a real directory through a copy-on-write VFS: preview every change as a diff, then commit or throw it away."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "openvfs-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+openvfs = { path = "../openvfs" }
+
+[lints]
+workspace = true

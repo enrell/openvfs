@@ -1,0 +1,18 @@
+[package]
+name = "openvfs"
+description = "A layered, pluggable virtual file system: in-memory, host-backed, mount tables and copy-on-write overlays."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["vfs", "filesystem", "overlay", "virtual", "sandbox"]
+categories = ["filesystem"]
+
+[dependencies]
+# Intentionally none: the whole VFS is built on `std`.
+
+[lints]
+workspace = true
