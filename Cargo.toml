@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/openvfs", "crates/openvfs-hook", "crates/openvfs-mods", "crates/openvfs-sandbox", "crates/openvfs-winfsp"]
+members = ["crates/openvfs", "crates/openvfs-hook", "crates/openvfs-sandbox", "crates/openvfs-winfsp"]
 
 [workspace.package]
 version = "0.1.1"

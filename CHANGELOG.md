@@ -5,52 +5,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the pr
 
 ## [Unreleased]
 
+### Removed
+- `openvfs-mods` (mod-management layer and CLI) — openvfs is the bridge between applications and a VFS;
+  mod management belongs in an application built on it, not in this workspace.
+
 ### Added
 - `VPath::folded()` / `FoldedPath` and `VPath::eq_ignore_case`: Unicode-lowercase keys that compare and hash
   case-insensitively while the original spelling is preserved for display and file access (`open-vfs`).
-- **`openvfs-mods`** — the mod-management layer:
-  - `MergedIndex`: a snapshot over ordered layers (`layers[0]` wins) keyed by folded path — `Textures/` and
-    `textures/` merge — answering lookups, listings and provenance without touching the file systems; explicit
-    `invalidate`/`rebuild`; ~700 ms over 100 thousand files in 500 layers.
-  - `CaseInsensitiveFs`: a `FileSystem` adapter resolving each component case-insensitively, preserving real casing.
-  - `Profile`: an ordered mod list (enable/disable/reorder, JSON persistence) that assembles an `OverlayFs` with an
-    `overwrite` upper; missing mods are skipped with diagnostics, a missing game directory is an error.
-  - `ConflictReport`: winner + ordered losers for every contested path, with per-mod counts.
-  - `deploy`: plans the diff between the game directory and the merged index, then applies it transactionally —
-    hardlinks with cross-volume copy fallback, a write-ahead JSONL journal (resume/rollback after a crash),
-    a SHA-256 manifest, originals preserved under `backup/` for byte-for-byte `undeploy`, drift detection via
-    `verify`, and `capture` of game writes into the overwrite directory. `PlanOptions::copy_under` for subtrees
-    the game writes in place (see the hardlink caveat in the module docs).
-  - Structured logging via the `log` facade and an `openvfs-mods` CLI: `profile`, `conflicts`, `deploy`,
-    `undeploy`, `verify`, `capture`, `status`, `resume`, `rollback`, `game`.
 - **`openvfs-winfsp`** (Windows): mounts any `FileSystem` through WinFsp, bound dynamically at runtime — no SDK at
   build time; 20 filesystem callbacks implemented. The runtime DLL is discovered beyond `PATH` (registry
   `InstallDir`, the `WinFsp.Launcher` service image, `Program Files` and versioned `SxS` layouts), and directory
   mount points follow junction semantics — WinFsp creates and removes them. Real-mount tests run when the driver
   is installed and self-skip otherwise.
-- `openvfs-mods mount <file> <dir-or-drive>` (Windows): serves the profile's merged view as a real filesystem —
-  every process sees it without deployment or injection; writes land in `overwrite`, deletes persist in a
-  `<profile>.whiteouts` sidecar across mounts.
 - `OverlayFs::hide`: records a whiteout without deleting anything, to replay a persisted `whiteouts()` set.
 - **`openvfs-hook`** (Windows): per-process merged view via Win32 API detours (`ilhook` engine): `CreateFile*`,
   `Find*`, attributes, delete/rename/copy/move, writes captured to `overwrite`, whiteouts; injector + synthetic
-  game verified end-to-end live. Foundation grade — see `docs/hook-spec.md` for coverage and remaining work.
-- `docs/recovery.md`: journal/manifest layout and recovery procedures for the deployment engine.
+  program verified end-to-end live. Foundation grade — see `docs/hook-spec.md` for coverage and remaining work.
 
 ### Fixed
-- `openvfs-mods` deploy: a deployed file displacing a *directory* recorded no backup (unrestorable), and a file
-  displaced by a created directory had no manifest entry to hang one on — undeploy now restores both.
-- `openvfs-mods` CLI: profile paths stored relative depended on the caller's CWD; they are absolutized on load.
 - `PhysicalFs::read_dir` returns entries sorted by name. On Linux and macOS the on-disk order is arbitrary, which made
   operations such as `copy_tree` fail at different points than the other backends.
 - Tests pass on Linux, macOS, Windows and Rust 1.88 (CI ran for the first time in this version).
-
-### Tests
-- Deployment fault injection at every plan position (crash → resume converges / rollback restores), a
-  deployed-vs-virtual differential suite, and randomized priority-ordering properties.
-- WinFsp real-mount suite (`mount_windows`): roundtrip and OS-vs-VFS differential through the actual driver,
-  verified against WinFsp 2.1+ (SxS layout).
-- ~890 tests total.
 
 ## [0.1.0] — 2026-10-15
 
