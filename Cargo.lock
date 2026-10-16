@@ -184,6 +184,7 @@ version = "0.1.1"
 dependencies = [
  "log",
  "open-vfs",
+ "openvfs-winfsp",
  "serde",
  "serde_json",
  "sha2",

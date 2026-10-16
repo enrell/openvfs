@@ -24,7 +24,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the pr
   - Structured logging via the `log` facade and an `openvfs-mods` CLI: `profile`, `conflicts`, `deploy`,
     `undeploy`, `verify`, `capture`, `status`, `resume`, `rollback`, `game`.
 - **`openvfs-winfsp`** (Windows): mounts any `FileSystem` through WinFsp, bound dynamically at runtime — no SDK at
-  build time; 20 filesystem callbacks implemented, tests self-skip without the driver.
+  build time; 20 filesystem callbacks implemented. The runtime DLL is discovered beyond `PATH` (registry
+  `InstallDir`, the `WinFsp.Launcher` service image, `Program Files` and versioned `SxS` layouts), and directory
+  mount points follow junction semantics — WinFsp creates and removes them. Real-mount tests run when the driver
+  is installed and self-skip otherwise.
+- `openvfs-mods mount <file> <dir-or-drive>` (Windows): serves the profile's merged view as a real filesystem —
+  every process sees it without deployment or injection; writes land in `overwrite`, deletes persist in a
+  `<profile>.whiteouts` sidecar across mounts.
+- `OverlayFs::hide`: records a whiteout without deleting anything, to replay a persisted `whiteouts()` set.
 - **`openvfs-hook`** (Windows): per-process merged view via Win32 API detours (`ilhook` engine): `CreateFile*`,
   `Find*`, attributes, delete/rename/copy/move, writes captured to `overwrite`, whiteouts; injector + synthetic
   game verified end-to-end live. Foundation grade — see `docs/hook-spec.md` for coverage and remaining work.
@@ -34,16 +41,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the pr
 - `openvfs-mods` deploy: a deployed file displacing a *directory* recorded no backup (unrestorable), and a file
   displaced by a created directory had no manifest entry to hang one on — undeploy now restores both.
 - `openvfs-mods` CLI: profile paths stored relative depended on the caller's CWD; they are absolutized on load.
+- `PhysicalFs::read_dir` returns entries sorted by name. On Linux and macOS the on-disk order is arbitrary, which made
+  operations such as `copy_tree` fail at different points than the other backends.
+- Tests pass on Linux, macOS, Windows and Rust 1.88 (CI ran for the first time in this version).
 
 ### Tests
 - Deployment fault injection at every plan position (crash → resume converges / rollback restores), a
   deployed-vs-virtual differential suite, and randomized priority-ordering properties.
-- 888 tests total.
-
-### Fixed
-- `PhysicalFs::read_dir` returns entries sorted by name. On Linux and macOS the on-disk order is arbitrary, which made
-  operations such as `copy_tree` fail at different points than the other backends.
-- Tests pass on Linux, macOS, Windows and Rust 1.88 (CI ran for the first time in this version).
+- WinFsp real-mount suite (`mount_windows`): roundtrip and OS-vs-VFS differential through the actual driver,
+  verified against WinFsp 2.1+ (SxS layout).
+- ~890 tests total.
 
 ## [0.1.0] — 2026-10-15
 

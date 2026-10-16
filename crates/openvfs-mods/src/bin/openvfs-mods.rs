@@ -4,6 +4,8 @@
 //! with `--state`. The binary is also where the library's `log` output gets
 //! wired up: a tiny stderr logger honoring `-v`/`-q` or `RUST_LOG`.
 
+#[cfg(windows)]
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -31,6 +33,8 @@ usage: openvfs-mods [-v|-q] <command> [args]
   resume --state DIR
   rollback --state DIR
   game <file> [--state DIR] [-- command args...]
+  mount <file> <dir-or-drive>       (Windows + WinFsp: serve the merged view
+                                   as a real filesystem until Enter)
 
 global flags: -v/-vv/-vvv raise log verbosity (info/debug/trace),
               -q warns only, RUST_LOG overrides; logs go to stderr.
@@ -67,6 +71,21 @@ usage: openvfs-mods conflicts <file> [--mod NAME]
 
 Prints every contested path (winner over losers). --mod filters to the
 conflicts NAME takes part in, as winner or loser.";
+
+#[cfg(windows)]
+const MOUNT_USAGE: &str = "\
+usage: openvfs-mods mount <file> <dir-or-drive>
+
+Mounts the profile's merged view (mods over the base game, with the
+overwrite dir on top) as a REAL filesystem — every process sees it, no
+deployment into the game dir needed. Requires WinFsp installed.
+
+The directory mount point is created by the mount itself (junction
+semantics): it must not exist, or must be an EMPTY directory (which is
+preserved across the mount). Press Enter (or close the console) to
+unmount; writes through the mount land in the overwrite directory, and
+deletes are recorded in <file>.whiteouts next to the profile so they
+survive re-mounts.";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
@@ -112,6 +131,7 @@ fn dispatch(command: &str, args: &[String], verbose: i32) -> ExitCode {
         "resume" => cmd_resume_or_rollback(args, true),
         "rollback" => cmd_resume_or_rollback(args, false),
         "game" => cmd_game(args),
+        "mount" => cmd_mount(args),
         other => {
             eprintln!("error: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(2)
@@ -650,6 +670,97 @@ fn cmd_game(args: &[String]) -> ExitCode {
         );
         Ok(ExitCode::SUCCESS)
     })
+}
+
+// ---------------------------------------------------------------- mount
+
+/// Windows + `WinFsp`: serve the profile's merged view as a real filesystem.
+/// Every process sees the mounted tree; writes land in the overwrite dir
+/// (the overlay's upper), so nothing touches the base game at all.
+#[cfg(windows)]
+fn cmd_mount(args: &[String]) -> ExitCode {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{MOUNT_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let mut positional = positionals(args, &[]).into_iter();
+    let (Some(file), Some(mountpoint)) = (positional.next(), positional.next()) else {
+        return usage_err("expected <file> <dir-or-drive>", MOUNT_USAGE);
+    };
+    if !openvfs_winfsp::Mount::is_available() {
+        eprintln!(
+            "error: WinFsp is not installed — `mount` needs its driver.\n\
+             Install it once (as admin) from https://winfsp.dev or `winget install winfsp`."
+        );
+        return ExitCode::FAILURE;
+    }
+    run(move || {
+        let profile = load_profile(&file)?;
+        let built = profile.build()?;
+        for skipped in built.skipped() {
+            eprintln!("warning: skipped mod {skipped}");
+        }
+        // Deletes through the mount are in-memory whiteouts; persist them
+        // next to the profile so a re-mount keeps the same merged view.
+        let overlay = built.overlay();
+        let whiteout_file = Path::new(&file).with_extension("whiteouts");
+        if let Ok(saved) = std::fs::read_to_string(&whiteout_file) {
+            for path in saved.lines().filter_map(|l| openvfs::VPath::new(l).ok()) {
+                overlay.hide(&path);
+            }
+        }
+        let mount = openvfs_winfsp::Mount::mount(
+            std::sync::Arc::clone(overlay),
+            Path::new(&mountpoint),
+            openvfs_winfsp::MountOptions::default(),
+        )
+        .map_err(|e| openvfs_mods::Error::Mount { reason: e.to_string() })?;
+        println!("mounted profile {:?} at {}", profile.name, mount.mountpoint());
+        println!("writes land in {}", profile.overwrite_dir.display());
+        // Flush whiteouts whenever they change (once a second at most), so
+        // even a killed process keeps its deletes for the next mount.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flusher = {
+            let overlay = std::sync::Arc::clone(overlay);
+            let file = whiteout_file.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut last = String::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let saved = overlay.whiteouts().iter().fold(String::new(), |mut s, p| {
+                        use std::fmt::Write as _;
+                        let _ = writeln!(s, "{p}");
+                        s
+                    });
+                    if saved != last && std::fs::write(&file, &saved).is_ok() {
+                        last = saved;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            })
+        };
+        if std::io::stdin().is_terminal() {
+            println!("press Enter to unmount");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok();
+        } else {
+            println!("running non-interactively — the mount lives until this process exits");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flusher.join().ok();
+        drop(mount);
+        println!("unmounted");
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+#[cfg(not(windows))]
+fn cmd_mount(_args: &[String]) -> ExitCode {
+    eprintln!("error: `mount` is only supported on Windows with WinFsp installed");
+    ExitCode::FAILURE
 }
 
 // ---------------------------------------------------------------- misc

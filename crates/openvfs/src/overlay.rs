@@ -223,6 +223,15 @@ impl OverlayFs {
         sync::read(&self.state).0.iter().cloned().collect()
     }
 
+    /// Hides `path` without touching any layer: records a whiteout so lower
+    /// content at `path` becomes invisible. Unlike [`OverlayFs::remove_file`]
+    /// and friends, nothing is deleted — this exists to *replay* whiteouts a
+    /// caller persisted from [`OverlayFs::whiteouts`]. If `path` exists in the
+    /// upper it stays visible; prefer `remove_*` for an actual delete.
+    pub fn hide(&self, path: &VPath) {
+        sync::write(&self.state).hide(path);
+    }
+
     /// Cheap check for pending writes. May be `true` while [`OverlayFs::changes`]
     /// is empty — e.g. after a file was copied up but rewritten unchanged.
     pub fn is_dirty(&self) -> Result<bool> {

@@ -136,18 +136,20 @@ fn differential_overlay_fs() {
         eprintln!("SKIP: WinFsp not installed — differential_overlay_fs");
         return;
     }
-    // Seed the lower layer identically in both universes.
-    let seed = || {
-        let mem = MemoryFs::new();
-        mem.create_dir(&VPath::new("/base").unwrap()).unwrap();
-        let mut f =
-            mem.open(&VPath::new("/base/lower.txt").unwrap(), &OpenOptions::new().write(true).create(true)).unwrap();
-        std::io::Write::write_all(&mut f, b"lower").unwrap();
-        mem
-    };
+    // The mount and the parallel `Vfs` share ONE overlay backend (mounting
+    // takes the `FileSystem` by value, so the `Arc` is the way to keep a
+    // handle): OS writes land in the overlay's upper, visible through `vfs`.
+    let lower = MemoryFs::new();
+    lower.create_dir(&VPath::new("/base").unwrap()).unwrap();
+    lower
+        .open(&VPath::new("/base/lower.txt").unwrap(), &OpenOptions::new().write(true).create(true))
+        .unwrap()
+        .write_all(b"lower")
+        .unwrap();
+    let overlay = std::sync::Arc::new(OverlayFs::new(MemoryFs::new(), lower));
     let mp = temp_mount_point("ovfs");
-    let m = Mount::mount(OverlayFs::new(MemoryFs::new(), seed()), &mp, MountOptions::default()).unwrap();
-    let vfs = Vfs::new(OverlayFs::new(MemoryFs::new(), seed()));
+    let m = Mount::mount(overlay.clone(), &mp, MountOptions::default()).unwrap();
+    let vfs = Vfs::from(overlay);
 
     // Read-through from the lower layer + copy-up on write.
     assert_eq!(fs::read(mp.join("base").join("lower.txt")).unwrap(), b"lower");

@@ -48,7 +48,10 @@ that *looks* merged by mod priority without ever touching the originals. Two tra
   captured into an `overwrite` directory, and `undeploy` restores the game directory byte-for-byte. Ships as a
   library plus the `openvfs-mods` CLI; see [`docs/recovery.md`](docs/recovery.md).
 - **Real virtualization** ([`openvfs-winfsp`](crates/openvfs-winfsp), Windows): mounts any `FileSystem` as a real
-  drive/directory via [WinFsp](https://winfsp.dev) — bound dynamically at runtime, so no SDK is needed to build.
+  drive/directory via [WinFsp](https://winfsp.dev) — bound dynamically at runtime, so no SDK is needed to build;
+  the runtime DLL is discovered in installed layouts (registry `InstallDir`, SxS) and never needs to be on
+  `PATH`. `openvfs-mods mount <profile> <dir-or-drive>` serves a profile's merged view this way — every process
+  sees it, writes land in `overwrite`, deletes persist across mounts.
 - **Per-process interception** ([`openvfs-hook`](crates/openvfs-hook), Windows): a DLL that gives one process a
   merged view by detouring Win32 file APIs — the mechanism class that tools like Mod Organizer use, built
   clean-room. Foundation-grade; see [`docs/hook-spec.md`](docs/hook-spec.md) for the coverage matrix and risks.

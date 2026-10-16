@@ -8,7 +8,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 
@@ -49,6 +49,9 @@ pub struct Mount {
     host: Box<Host>,
     /// Where we mounted (informational only).
     mountpoint: String,
+    /// An empty directory we removed so WinFsp could create its junction
+    /// there; recreated on unmount (see `mount` for the semantics).
+    recreate_dir: Option<PathBuf>,
 }
 
 // SAFETY: `Mount` owns the WinFsp `*mut FspFileSystem`. The only raw pointer
@@ -64,9 +67,13 @@ impl Mount {
     // `mount()` constructor mirrors `std::thread::spawn`-style naming.
     #[allow(clippy::self_named_constructors)]
     ///
-    /// `mountpoint` is either a drive letter (`X:`) or an **existing, empty
-    /// directory** — WinFsp itself rejects non-empty directory mount points.
-    /// The mount stays live until the returned `Mount` is dropped.
+    /// `mountpoint` is either a drive letter (`X:`) or a directory path.
+    /// Directory mounts work like `mklink /J`: WinFsp creates the junction —
+    /// so the path **must not exist**. An *existing empty directory* is
+    /// handled gracefully: it is removed before mounting and recreated on
+    /// unmount. A non-empty directory or a file at the path is
+    /// [`Error::InvalidMountPoint`]. The mount stays live until the returned
+    /// `Mount` is dropped.
     ///
     /// # Errors
     ///
@@ -136,12 +143,36 @@ impl Mount {
         // it); `host` is a stable Box the `Mount` keeps alive to the end.
         unsafe { (*fs_obj).user_context = &mut *host as *mut Host as *mut c_void };
 
+        // `FspFileSystemSetMountPoint` creates the mount point itself — it is
+        // junction semantics (`mklink /J`), so the name must be free. A drive
+        // letter skips the whole check; a path that already exists must be an
+        // empty directory, which we remove now and recreate on unmount.
+        let mut recreate_dir = None;
+        if !looks_like_drive_letter(mountpoint) && mountpoint.exists() {
+            let fail = |e: Error| -> Error {
+                // SAFETY: dispatcher never started; the object is valid to delete.
+                unsafe { (api.delete)(fs_obj) };
+                e
+            };
+            if !mountpoint.is_dir() {
+                return Err(fail(Error::InvalidMountPoint(format!("{}", mountpoint.display()))));
+            }
+            match std::fs::remove_dir(mountpoint) {
+                Ok(()) => recreate_dir = Some(mountpoint.to_path_buf()),
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    return Err(fail(Error::InvalidMountPoint(format!("{}", mountpoint.display()))));
+                }
+                Err(e) => return Err(fail(Error::Io(e))),
+            }
+        }
+
         let mut mp_wide = os_wide(mountpoint)?;
         // SAFETY: `mp_wide` is NUL-terminated UTF-16.
         let st = unsafe { (api.set_mount_point)(fs_obj, mp_wide.as_mut_ptr()) };
         if st != STATUS_SUCCESS {
             // SAFETY: dispatcher never started; the object is valid to delete.
             unsafe { (api.delete)(fs_obj) };
+            restore_removed_dir(&recreate_dir);
             return Err(Error::NtStatus { op: "FspFileSystemSetMountPoint", status: st });
         }
 
@@ -154,10 +185,11 @@ impl Mount {
                 (api.remove_mount_point)(fs_obj);
                 (api.delete)(fs_obj);
             }
+            restore_removed_dir(&recreate_dir);
             return Err(Error::NtStatus { op: "FspFileSystemStartDispatcher", status: st });
         }
 
-        Ok(Self { fs: fs_obj, host, mountpoint: mountpoint.display().to_string() })
+        Ok(Self { fs: fs_obj, host, mountpoint: mountpoint.display().to_string(), recreate_dir })
     }
 
     /// Returns `true` if the WinFsp runtime (`winfsp-x64.dll` et al.) can be
@@ -206,6 +238,7 @@ impl Drop for Mount {
                     drop(Box::from_raw(ctx as *mut crate::host::Handle));
                 }
             }
+            restore_removed_dir(&self.recreate_dir);
         }
     }
 }
@@ -223,4 +256,21 @@ fn os_wide(p: &Path) -> Result<Vec<u16>, Error> {
     }
     v.push(0);
     Ok(v)
+}
+
+/// `true` for `X:`-style drive letters (with or without a trailing `\`).
+fn looks_like_drive_letter(p: &Path) -> bool {
+    let s = p.as_os_str();
+    let bytes = s.as_encoded_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2..].iter().all(|&b| b == b'\\' || b == b'/'))
+}
+
+/// Recreates an empty directory removed before mounting (junction semantics).
+fn restore_removed_dir(dir: &Option<PathBuf>) {
+    if let Some(dir) = dir {
+        let _ = std::fs::create_dir(dir);
+    }
 }

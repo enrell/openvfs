@@ -33,6 +33,12 @@ pub enum Error {
         /// What went wrong.
         reason: String,
     },
+    /// Mounting the merged view through the optional `WinFsp` backend failed
+    /// (driver missing, mount point rejected, or the bridge itself failed).
+    Mount {
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -45,6 +51,7 @@ impl fmt::Display for Error {
                 write!(f, "{role} directory does not exist: {}", path.display())
             }
             Self::Deploy { reason } => write!(f, "deployment: {reason}"),
+            Self::Mount { reason } => write!(f, "mount: {reason}"),
         }
     }
 }
@@ -55,7 +62,7 @@ impl std::error::Error for Error {
             Self::Vfs(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::Json(e) => Some(e),
-            Self::MissingDirectory { .. } | Self::Deploy { .. } => None,
+            Self::MissingDirectory { .. } | Self::Deploy { .. } | Self::Mount { .. } => None,
         }
     }
 }
