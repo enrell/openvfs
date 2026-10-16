@@ -12,6 +12,7 @@ mod deploy;
 mod deploy_faults;
 mod differential_deploy;
 mod index;
+mod install;
 mod priority_prop;
 mod profile;
 mod scaling;

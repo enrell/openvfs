@@ -39,6 +39,12 @@ pub enum Error {
         /// What went wrong.
         reason: String,
     },
+    /// Installing a mod from an archive or folder failed (unreadable or
+    /// unsafe archive, no extractor, name clash).
+    Install {
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -52,6 +58,7 @@ impl fmt::Display for Error {
             }
             Self::Deploy { reason } => write!(f, "deployment: {reason}"),
             Self::Mount { reason } => write!(f, "mount: {reason}"),
+            Self::Install { reason } => write!(f, "install: {reason}"),
         }
     }
 }
@@ -62,7 +69,7 @@ impl std::error::Error for Error {
             Self::Vfs(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::Json(e) => Some(e),
-            Self::MissingDirectory { .. } | Self::Deploy { .. } | Self::Mount { .. } => None,
+            Self::MissingDirectory { .. } | Self::Deploy { .. } | Self::Mount { .. } | Self::Install { .. } => None,
         }
     }
 }

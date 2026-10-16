@@ -15,6 +15,8 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Native .zip reading for `install`; other formats go to an external 7z/bsdtar.
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma"] }
 
 # The `mount` subcommand needs the WinFsp bridge; it only exists on Windows.
 [target.'cfg(windows)'.dependencies]

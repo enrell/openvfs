@@ -211,3 +211,49 @@ fn logger_honors_quiet_and_verbose() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stderr(&out).contains("INFO"), "verbose must show info logs: {}", stderr(&out));
 }
+
+/// `game --mount`: the command runs inside the mounted merged view, its
+/// writes land in the overwrite dir, the game dir is never touched, and the
+/// game's exit code comes back out. Needs WinFsp; skips without it.
+#[cfg(windows)]
+#[test]
+fn game_mount_runs_inside_the_merged_view() {
+    if !openvfs_winfsp::is_available() {
+        eprintln!("skipping: WinFsp is not installed");
+        return;
+    }
+    let world = World::new();
+    let before = host_tree(&world.game);
+    let mountpoint = world.root.path().join("mnt");
+    let mnt = World::arg(&mountpoint);
+
+    // `copy` reads the winning mod's file through the mount and writes a
+    // new one next to it.
+    let out = run(
+        world.root.path(),
+        &["game", "profile.json", "--mount", &mnt, "--", "cmd", "/c", "copy", r"data\shared.txt", r"data\copied.txt"],
+    );
+    assert!(out.status.success(), "stdout:\n{}\nstderr:\n{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("unmounted"), "{}", stdout(&out));
+    assert_eq!(std::fs::read_to_string(world.overwrite.join("data/copied.txt")).unwrap(), "m1 wins");
+    assert_eq!(host_tree(&world.game), before, "a mounted run must not touch the game dir");
+    assert!(!mountpoint.exists() || std::fs::read_dir(&mountpoint).unwrap().next().is_none(), "unmounted");
+
+    // `{mount}` substitution and exit-code propagation.
+    let out = run(
+        world.root.path(),
+        &["game", "profile.json", "--mount", &mnt, "--", "cmd", "/c", r"if exist {mount}\only2.txt exit 7"],
+    );
+    assert_eq!(out.status.code(), Some(7), "stdout:\n{}\nstderr:\n{}", stdout(&out), stderr(&out));
+
+    // Usage errors: no command, or --state together with --mount.
+    let out = run(world.root.path(), &["game", "profile.json", "--mount", &mnt]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = run(world.root.path(), &["game", "profile.json", "--mount", &mnt, "--state", "s", "--", "cmd"]);
+    assert_eq!(out.status.code(), Some(2));
+    // `mount` flag validation happens before anything is mounted.
+    let out = run(world.root.path(), &["mount", "profile.json", &mnt, "--threads", "many"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let out = run(world.root.path(), &["mount", "profile.json", &mnt, "--bogus"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}

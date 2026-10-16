@@ -57,6 +57,7 @@ mod conflicts;
 pub mod deploy;
 mod error;
 mod index;
+pub mod install;
 mod profile;
 
 pub use ci::CaseInsensitiveFs;
@@ -68,4 +69,5 @@ pub use deploy::{
 };
 pub use error::{Error, Result};
 pub use index::{IndexEntry, Layer, MergedIndex, Provider};
+pub use install::{InstallOptions, Installed, install_mod};
 pub use profile::{BuiltProfile, LoadedMod, ModEntry, Profile, SkippedMod};

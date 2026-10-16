@@ -23,6 +23,8 @@ usage: openvfs-mods [-v|-q] <command> [args]
   profile enable|disable <file> <mod>
   profile move <file> <mod> --to INDEX
   profile show <file>
+  install <file> <archive-or-dir> [--name N] [--mods DIR] [--at INDEX]
+          [--keep-root] [--replace]
   conflicts <file> [--mod NAME]
   deploy <file> --state DIR [--mode link|copy] [--copy-under PATH]...
          [--foreign keep|error] [--dry-run]
@@ -32,8 +34,9 @@ usage: openvfs-mods [-v|-q] <command> [args]
   status <file> --state DIR
   resume --state DIR
   rollback --state DIR
-  game <file> [--state DIR] [-- command args...]
-  mount <file> <dir-or-drive>       (Windows + WinFsp: serve the merged view
+  game <file> [--state DIR | --mount DIR] [-- command args...]
+  mount <file> <dir-or-drive> [--label L] [--threads N] [--read-only]
+                                  (Windows + WinFsp: serve the merged view
                                    as a real filesystem until Enter)
 
 global flags: -v/-vv/-vvv raise log verbosity (info/debug/trace),
@@ -51,10 +54,30 @@ usage: openvfs-mods deploy <file> --state DIR [options]
 
 const GAME_USAGE: &str = "\
 usage: openvfs-mods game <file> [--state DIR] [-- command args...]
+       openvfs-mods game <file> --mount DIR -- command args...
 
-Deploys the profile, then either runs `command` and captures its writes on
-exit, or — without a command — prints how to capture after playing.
---state defaults to <file>.state next to the profile.";
+Deploy mode (default): deploys the profile, then either runs `command` and
+captures its writes on exit, or — without a command — prints how to
+capture after playing. --state defaults to <file>.state next to the profile.
+
+Mount mode (--mount, Windows + WinFsp): mounts the merged view at DIR, runs
+`command` from inside it (working directory DIR; a relative program found
+in the mount runs from there; `{mount}` in any argument becomes DIR), and
+unmounts when it exits. Nothing is written into the game dir; the game's
+writes land in the overwrite dir. Exits with the game's exit code.";
+
+const INSTALL_USAGE: &str = "\
+usage: openvfs-mods install <file> <archive-or-dir> [options]
+
+Extracts a mod (.zip natively; .7z/.rar/.tar.* via 7-Zip or bsdtar) into
+the mods dir and adds it to the profile at the top of the load order.
+
+  --name N      mod name (default: the archive name without extension)
+  --mods DIR    where mods live (default: `mods` next to the profile)
+  --at INDEX    load-order position instead of the top (0 = highest)
+  --keep-root   don't unwrap a lone top-level folder in the archive
+  --replace     reinstall over an existing mod of the same name, keeping
+                its place in the load order";
 
 const PROFILE_USAGE: &str = "\
 usage: openvfs-mods profile <sub> ...
@@ -74,7 +97,7 @@ conflicts NAME takes part in, as winner or loser.";
 
 #[cfg(windows)]
 const MOUNT_USAGE: &str = "\
-usage: openvfs-mods mount <file> <dir-or-drive>
+usage: openvfs-mods mount <file> <dir-or-drive> [--label L] [--threads N] [--read-only]
 
 Mounts the profile's merged view (mods over the base game, with the
 overwrite dir on top) as a REAL filesystem — every process sees it, no
@@ -85,7 +108,11 @@ semantics): it must not exist, or must be an EMPTY directory (which is
 preserved across the mount). Press Enter (or close the console) to
 unmount; writes through the mount land in the overwrite directory, and
 deletes are recorded in <file>.whiteouts next to the profile so they
-survive re-mounts.";
+survive re-mounts.
+
+  --label L     volume label shown by Explorer (default: OpenVFS)
+  --threads N   WinFsp dispatcher threads (default: WinFsp's choice)
+  --read-only   refuse every write through the mount";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
@@ -122,6 +149,7 @@ fn dispatch(command: &str, args: &[String], verbose: i32) -> ExitCode {
     init_logger(verbose);
     match command {
         "profile" => cmd_profile(args),
+        "install" => cmd_install(args),
         "conflicts" => cmd_conflicts(args),
         "deploy" => cmd_deploy(args),
         "undeploy" => cmd_undeploy(args),
@@ -353,6 +381,72 @@ fn profile_show(args: &[String]) -> ExitCode {
             let mark = if m.enabled { "x" } else { " " };
             println!("  {i:>3}. [{mark}] {} ({})", m.name, m.source_dir.display());
         }
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+// ---------------------------------------------------------------- install
+
+fn cmd_install(args: &[String]) -> ExitCode {
+    const VALUE_FLAGS: &[&str] = &["--name", "--mods", "--at"];
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{INSTALL_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if let Some(flag) = args.iter().find(|a| {
+        a.starts_with('-') && !VALUE_FLAGS.contains(&a.as_str()) && !matches!(a.as_str(), "--keep-root" | "--replace")
+    }) {
+        return usage_err(&format!("unknown flag `{flag}`"), INSTALL_USAGE);
+    }
+    let mut positional = positionals(args, VALUE_FLAGS).into_iter();
+    let (Some(file), Some(source)) = (positional.next(), positional.next()) else {
+        return usage_err("expected <file> <archive-or-dir>", INSTALL_USAGE);
+    };
+    let at = match flag_value(args, "--at").map(|v| v.parse::<usize>()) {
+        None => None,
+        Some(Ok(i)) => Some(i),
+        Some(Err(_)) => return usage_err("--at expects an index", INSTALL_USAGE),
+    };
+    let options = openvfs_mods::InstallOptions {
+        name: flag_value(args, "--name"),
+        keep_root: args.iter().any(|a| a == "--keep-root"),
+        replace: args.iter().any(|a| a == "--replace"),
+    };
+    let mods_dir = flag_value(args, "--mods")
+        .map_or_else(|| Path::new(&file).parent().unwrap_or(Path::new("")).join("mods"), PathBuf::from);
+    run(move || {
+        let mut profile = load_profile(&file)?;
+        if !options.replace
+            && let Some(name) =
+                options.name.clone().or_else(|| openvfs_mods::install::default_mod_name(Path::new(&source)))
+            && profile.mods.iter().any(|m| m.name == name)
+        {
+            eprintln!("error: the profile already has a mod named {name:?} (use --replace or --name)");
+            return Ok(ExitCode::FAILURE);
+        }
+        let installed = openvfs_mods::install_mod(Path::new(&source), &mods_dir, Some(&profile.game_dir), &options)?;
+        let dir = std::path::absolute(&installed.dir).unwrap_or_else(|_| installed.dir.clone());
+        // A reinstall keeps the mod's place and enabled state.
+        let position = if let Some(i) = profile.mods.iter().position(|m| m.name == installed.name) {
+            profile.mods[i].source_dir.clone_from(&dir);
+            i
+        } else {
+            let index = at.unwrap_or(0).min(profile.mods.len());
+            profile
+                .insert_mod(index, ModEntry { name: installed.name.clone(), source_dir: dir.clone(), enabled: true });
+            index
+        };
+        profile.save(&file)?;
+        for wrapper in &installed.unwrapped {
+            println!("unwrapped top-level folder {wrapper:?}");
+        }
+        println!(
+            "{} mod {:?}: {} file(s) in {} (priority {position})",
+            if installed.replaced { "reinstalled" } else { "installed" },
+            installed.name,
+            installed.files,
+            dir.display()
+        );
         Ok(ExitCode::SUCCESS)
     })
 }
@@ -641,8 +735,22 @@ fn cmd_game(args: &[String]) -> ExitCode {
     let split = args.iter().position(|a| a == "--").unwrap_or(args.len());
     let trailing: Vec<String> = args.get(split + 1..).map_or_else(Vec::new, <[String]>::to_vec);
     let state = flag_value(&args[..split], "--state").map(PathBuf::from);
-    let mut positional = positionals(&args[..split], &["--state"]).into_iter();
+    let mount = flag_value(&args[..split], "--mount");
+    let mut positional = positionals(&args[..split], &["--state", "--mount"]).into_iter();
     let Some(file) = positional.next() else { return usage_err("expected <file>", GAME_USAGE) };
+    if let Some(mountpoint) = mount {
+        if state.is_some() {
+            return usage_err("--mount and --state are exclusive: a mount deploys nothing", GAME_USAGE);
+        }
+        if trailing.is_empty() {
+            return usage_err("--mount needs the game command after `--`", GAME_USAGE);
+        }
+        #[cfg(windows)]
+        if !require_winfsp() {
+            return ExitCode::FAILURE;
+        }
+        return run(move || game_mounted(&file, &mountpoint, &trailing));
+    }
     let state = state.unwrap_or_else(|| Path::new(&file).with_extension("state"));
     run(move || {
         let profile = load_profile(&file)?;
@@ -674,28 +782,24 @@ fn cmd_game(args: &[String]) -> ExitCode {
 
 // ---------------------------------------------------------------- mount
 
-/// Windows + `WinFsp`: serve the profile's merged view as a real filesystem.
-/// Every process sees the mounted tree; writes land in the overwrite dir
-/// (the overlay's upper), so nothing touches the base game at all.
+/// A live `WinFsp` mount of a profile's merged view, plus the thread that
+/// persists its whiteouts. Shared by `mount` and `game --mount`.
 #[cfg(windows)]
-fn cmd_mount(args: &[String]) -> ExitCode {
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{MOUNT_USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    let mut positional = positionals(args, &[]).into_iter();
-    let (Some(file), Some(mountpoint)) = (positional.next(), positional.next()) else {
-        return usage_err("expected <file> <dir-or-drive>", MOUNT_USAGE);
-    };
-    if !openvfs_winfsp::Mount::is_available() {
-        eprintln!(
-            "error: WinFsp is not installed — `mount` needs its driver.\n\
-             Install it once (as admin) from https://winfsp.dev or `winget install winfsp`."
-        );
-        return ExitCode::FAILURE;
-    }
-    run(move || {
-        let profile = load_profile(&file)?;
+struct MountSession {
+    mount: openvfs_winfsp::Mount,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    flusher: std::thread::JoinHandle<()>,
+}
+
+#[cfg(windows)]
+impl MountSession {
+    /// Mounts `profile` (loaded from `file`) at `mountpoint`.
+    fn start(
+        file: &str,
+        profile: &Profile,
+        mountpoint: &Path,
+        options: openvfs_winfsp::MountOptions,
+    ) -> Result<Self, openvfs_mods::Error> {
         let built = profile.build()?;
         for skipped in built.skipped() {
             eprintln!("warning: skipped mod {skipped}");
@@ -703,42 +807,120 @@ fn cmd_mount(args: &[String]) -> ExitCode {
         // Deletes through the mount are in-memory whiteouts; persist them
         // next to the profile so a re-mount keeps the same merged view.
         let overlay = built.overlay();
-        let whiteout_file = Path::new(&file).with_extension("whiteouts");
+        let whiteout_file = Path::new(file).with_extension("whiteouts");
         if let Ok(saved) = std::fs::read_to_string(&whiteout_file) {
             for path in saved.lines().filter_map(|l| openvfs::VPath::new(l).ok()) {
                 overlay.hide(&path);
             }
         }
-        let mount = openvfs_winfsp::Mount::mount(
-            std::sync::Arc::clone(overlay),
-            Path::new(&mountpoint),
-            openvfs_winfsp::MountOptions::default(),
-        )
-        .map_err(|e| openvfs_mods::Error::Mount { reason: e.to_string() })?;
-        println!("mounted profile {:?} at {}", profile.name, mount.mountpoint());
-        println!("writes land in {}", profile.overwrite_dir.display());
+        let mount = openvfs_winfsp::Mount::mount(std::sync::Arc::clone(overlay), mountpoint, options)
+            .map_err(|e| openvfs_mods::Error::Mount { reason: e.to_string() })?;
         // Flush whiteouts whenever they change (once a second at most), so
         // even a killed process keeps its deletes for the next mount.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flusher = {
             let overlay = std::sync::Arc::clone(overlay);
-            let file = whiteout_file.clone();
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
                 let mut last = String::new();
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                loop {
                     let saved = overlay.whiteouts().iter().fold(String::new(), |mut s, p| {
                         use std::fmt::Write as _;
                         let _ = writeln!(s, "{p}");
                         s
                     });
-                    if saved != last && std::fs::write(&file, &saved).is_ok() {
+                    if saved != last && std::fs::write(&whiteout_file, &saved).is_ok() {
                         last = saved;
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    // Checked after the flush so the final state is saved.
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::park_timeout(std::time::Duration::from_secs(1));
                 }
             })
         };
+        Ok(Self { mount, stop, flusher })
+    }
+
+    fn mountpoint(&self) -> &str {
+        self.mount.mountpoint()
+    }
+
+    /// Flushes the whiteouts one last time and unmounts.
+    fn finish(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.flusher.thread().unpark();
+        self.flusher.join().ok();
+        drop(self.mount);
+    }
+}
+
+/// Parses `--label`/`--threads`/`--read-only` into `WinFsp` options.
+#[cfg(windows)]
+fn parse_mount_options(args: &[String]) -> Result<openvfs_winfsp::MountOptions, String> {
+    let mut options = openvfs_winfsp::MountOptions::default();
+    if let Some(label) = flag_value(args, "--label") {
+        options = options.volume_label(label);
+    }
+    if let Some(threads) = flag_value(args, "--threads") {
+        let n = threads.parse::<u32>().map_err(|_| format!("--threads expects a number, got {threads:?}"))?;
+        options = options.dispatcher_threads(n);
+    }
+    if args.iter().any(|a| a == "--read-only") {
+        options = options.read_only(true);
+    }
+    Ok(options)
+}
+
+#[cfg(windows)]
+fn require_winfsp() -> bool {
+    let ok = openvfs_winfsp::Mount::is_available();
+    if !ok {
+        eprintln!(
+            "error: WinFsp is not installed — mounting needs its driver.\n\
+             Install it once (as admin) from https://winfsp.dev or `winget install winfsp`."
+        );
+    }
+    ok
+}
+
+/// Windows + `WinFsp`: serve the profile's merged view as a real filesystem.
+/// Every process sees the mounted tree; writes land in the overwrite dir
+/// (the overlay's upper), so nothing touches the base game at all.
+#[cfg(windows)]
+fn cmd_mount(args: &[String]) -> ExitCode {
+    const VALUE_FLAGS: &[&str] = &["--label", "--threads"];
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{MOUNT_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if let Some(flag) =
+        args.iter().find(|a| a.starts_with('-') && !VALUE_FLAGS.contains(&a.as_str()) && *a != "--read-only")
+    {
+        return usage_err(&format!("unknown flag `{flag}`"), MOUNT_USAGE);
+    }
+    let options = match parse_mount_options(args) {
+        Ok(o) => o,
+        Err(msg) => return usage_err(&msg, MOUNT_USAGE),
+    };
+    let mut positional = positionals(args, VALUE_FLAGS).into_iter();
+    let (Some(file), Some(mountpoint)) = (positional.next(), positional.next()) else {
+        return usage_err("expected <file> <dir-or-drive>", MOUNT_USAGE);
+    };
+    if !require_winfsp() {
+        return ExitCode::FAILURE;
+    }
+    run(move || {
+        let profile = load_profile(&file)?;
+        let read_only = options.read_only;
+        let session = MountSession::start(&file, &profile, Path::new(&mountpoint), options)?;
+        println!("mounted profile {:?} at {}", profile.name, session.mountpoint());
+        if read_only {
+            println!("read-only: writes through the mount are refused");
+        } else {
+            println!("writes land in {}", profile.overwrite_dir.display());
+        }
         if std::io::stdin().is_terminal() {
             println!("press Enter to unmount");
             let mut line = String::new();
@@ -749,9 +931,7 @@ fn cmd_mount(args: &[String]) -> ExitCode {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
             }
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        flusher.join().ok();
-        drop(mount);
+        session.finish();
         println!("unmounted");
         Ok(ExitCode::SUCCESS)
     })
@@ -761,6 +941,38 @@ fn cmd_mount(args: &[String]) -> ExitCode {
 fn cmd_mount(_args: &[String]) -> ExitCode {
     eprintln!("error: `mount` is only supported on Windows with WinFsp installed");
     ExitCode::FAILURE
+}
+
+/// `game --mount DIR -- cmd…`: mount, run the game from inside the mount,
+/// unmount when it exits. The exit code is the game's.
+#[cfg(windows)]
+fn game_mounted(file: &str, mountpoint: &str, command: &[String]) -> Result<ExitCode, openvfs_mods::Error> {
+    let profile = load_profile(file)?;
+    let session = MountSession::start(file, &profile, Path::new(mountpoint), openvfs_winfsp::MountOptions::default())?;
+    let root = session.mountpoint().to_owned();
+    println!("mounted profile {:?} at {root}", profile.name);
+    let args: Vec<String> = command[1..].iter().map(|a| a.replace("{mount}", &root)).collect();
+    // A relative program that exists inside the mount (`game.exe`) runs from
+    // there; anything else is taken as given (PATH lookup, absolute path).
+    let program = {
+        let given = command[0].replace("{mount}", &root);
+        let inside = Path::new(&root).join(&given);
+        if Path::new(&given).is_relative() && inside.is_file() { inside } else { PathBuf::from(given) }
+    };
+    let status = std::process::Command::new(&program).args(&args).current_dir(&root).status();
+    session.finish();
+    println!("unmounted");
+    let status = status.map_err(|e| {
+        openvfs_mods::Error::Io(std::io::Error::new(e.kind(), format!("cannot run {}: {e}", program.display())))
+    })?;
+    println!("game exited: {status}");
+    println!("its writes are in {}", profile.overwrite_dir.display());
+    Ok(status.code().and_then(|c| u8::try_from(c).ok()).map_or(ExitCode::FAILURE, ExitCode::from))
+}
+
+#[cfg(not(windows))]
+fn game_mounted(_file: &str, _mountpoint: &str, _command: &[String]) -> Result<ExitCode, openvfs_mods::Error> {
+    Err(openvfs_mods::Error::Mount { reason: "`game --mount` needs Windows with WinFsp installed".into() })
 }
 
 // ---------------------------------------------------------------- misc
