@@ -1,8 +1,10 @@
 //! A file system backed by a directory on the host.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use crate::error::{Result, VfsError};
 use crate::fs::{DirEntry, FileSystem, FileType, Metadata, OpenOptions, VfsFile, classify_missing, msg};
@@ -57,6 +59,13 @@ pub struct PhysicalFs {
     root: PathBuf,
     read_only: bool,
     symlinks: Symlinks,
+    /// `path -> resolved host path + metadata` (`None` = known missing).
+    /// Only populated for read-only instances: their host tree does not change
+    /// while a mount is live, and the layers of a game's virtual view are
+    /// exactly that. A writable instance keeps every lookup uncached.
+    meta_cache: Option<Arc<RwLock<HashMap<VPath, Option<(PathBuf, Metadata)>>>>>,
+    /// `dir -> entries`. Same policy as `meta_cache`.
+    dir_cache: Option<Arc<RwLock<HashMap<VPath, Arc<Vec<DirEntry>>>>>>,
 }
 
 /// Configures a [`PhysicalFs`]; created by [`PhysicalFs::builder`].
@@ -89,7 +98,14 @@ impl PhysicalFsBuilder {
         if !root.is_dir() {
             return Err(host_err(io::ErrorKind::NotADirectory, format!("{} is not a directory", root.display())));
         }
-        Ok(PhysicalFs { root, read_only: self.read_only, symlinks: self.symlinks })
+        let cache = self.read_only;
+        Ok(PhysicalFs {
+            root,
+            read_only: self.read_only,
+            symlinks: self.symlinks,
+            meta_cache: cache.then(|| Arc::new(RwLock::new(HashMap::new()))),
+            dir_cache: cache.then(|| Arc::new(RwLock::new(HashMap::new()))),
+        })
     }
 }
 
@@ -200,6 +216,49 @@ impl PhysicalFs {
     }
 
     fn stat(&self, path: &VPath) -> Result<(PathBuf, Metadata)> {
+        if let Some(cache) = &self.meta_cache {
+            if let Some(hit) = cache.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(path).cloned() {
+                return match hit {
+                    Some((host, meta)) => Ok((host, meta)),
+                    None => Err(VfsError::NotFound(path.clone())),
+                };
+            }
+            let result = self.stat_uncached(path);
+            let entry = match &result {
+                Ok((host, meta)) => Some((host.clone(), meta.clone())),
+                Err(VfsError::NotFound(_) | VfsError::NotADirectory(_)) => None,
+                Err(_) => return result,
+            };
+            cache.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.clone(), entry);
+            return result;
+        }
+        self.stat_uncached(path)
+    }
+
+    fn read_dir_uncached(&self, path: &VPath) -> Result<Vec<DirEntry>> {
+        let (host, meta) = self.stat(path)?;
+        if !meta.is_dir() {
+            return Err(VfsError::NotADirectory(path.clone()));
+        }
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&host).map_err(|e| self.host_err(path, e))? {
+            let entry = entry.map_err(|e| VfsError::from_io(path, e))?;
+            // Names that cannot be expressed as a virtual path component are skipped.
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if name.contains('\\') || !is_valid_component(&name) {
+                continue;
+            }
+            let Some(file_type) = self.entry_type(&entry) else { continue };
+            entries.push(DirEntry { path: path.child(&name), name, file_type });
+        }
+        // Hosts list in arbitrary order (ext4, APFS); every other backend is sorted, and callers such as
+        // `copy_tree` fail at a different point when the order differs.
+        entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
+
+    fn stat_uncached(&self, path: &VPath) -> Result<(PathBuf, Metadata)> {
         let (host, known) = self.resolve(path)?;
         let meta = match known {
             Some(meta) => meta,
@@ -311,32 +370,25 @@ fn same_entry(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
+
+
 impl FileSystem for PhysicalFs {
     fn metadata(&self, path: &VPath) -> Result<Metadata> {
         self.stat(path).map(|(_, meta)| meta)
     }
 
     fn read_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
-        let (host, meta) = self.stat(path)?;
-        if !meta.is_dir() {
-            return Err(VfsError::NotADirectory(path.clone()));
-        }
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&host).map_err(|e| self.host_err(path, e))? {
-            let entry = entry.map_err(|e| VfsError::from_io(path, e))?;
-            // Names that cannot be expressed as a virtual path component are skipped.
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
-            if name.contains('\\') || !is_valid_component(&name) {
-                continue;
+        if let Some(cache) = &self.dir_cache {
+            if let Some(hit) = cache.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(path).cloned() {
+                return Ok((*hit).clone());
             }
-            let Some(file_type) = self.entry_type(&entry) else { continue };
-            entries.push(DirEntry { path: path.child(&name), name, file_type });
+            let entries = self.read_dir_uncached(path)?;
+            cache.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.clone(), Arc::new(entries.clone()));
+            return Ok(entries);
         }
-        // Hosts list in arbitrary order (ext4, APFS); every other backend is sorted, and callers such as
-        // `copy_tree` fail at a different point when the order differs.
-        entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
+        self.read_dir_uncached(path)
     }
+
 
     fn create_dir(&self, path: &VPath) -> Result<()> {
         self.writable(path)?;

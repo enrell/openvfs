@@ -102,6 +102,7 @@
 
 pub mod abi;
 pub mod attrs;
+pub mod dlog;
 mod error;
 pub mod host;
 mod options;

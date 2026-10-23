@@ -43,7 +43,17 @@ fn ffi(f: impl FnOnce() -> Result<(), NtStatus>) -> NtStatus {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => crate::status::STATUS_SUCCESS,
         Ok(Err(st)) => st,
-        Err(_) => STATUS_INTERNAL_ERROR,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                (*s).to_owned()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic>".to_owned()
+            };
+            eprintln!("PANIC in ffi callback: {msg}");
+            STATUS_INTERNAL_ERROR
+        }
     }
 }
 
@@ -203,7 +213,16 @@ unsafe extern "C" fn get_security_by_name(
         let h = unsafe { host(fs)? };
         // SAFETY: `file_name` is a NUL-terminated request string.
         let name = unsafe { str16(file_name)? };
-        let attrs = h.get_security_by_name(&name)?;
+        let r = h.get_security_by_name(&name);
+        crate::dlog::dlog_call(
+            "get_security_by_name",
+            &name,
+            &match &r {
+                Ok(_) => "ok".to_owned(),
+                Err(e) => format!("status 0x{:08x}", *e as u32),
+            },
+        );
+        let attrs = r?;
         if !p_file_attributes.is_null() {
             // SAFETY: `p_file_attributes` is a valid out-param.
             unsafe { *p_file_attributes = attrs };
@@ -272,7 +291,16 @@ unsafe extern "C" fn open(
         let h = unsafe { host(fs)? };
         // SAFETY: `file_name` is a NUL-terminated request string.
         let name = unsafe { str16(file_name)? };
-        open_out(h, h.open(&name, create_options, granted_access), p_file_context, file_info)
+        let r = h.open(&name, create_options, granted_access);
+        crate::dlog::dlog_call(
+            "open",
+            &name,
+            &match &r {
+                Ok(_) => "ok".to_owned(),
+                Err(e) => format!("status 0x{:08x}", *e as u32),
+            },
+        );
+        open_out(h, r, p_file_context, file_info)
     })
 }
 
@@ -288,6 +316,7 @@ unsafe extern "C" fn overwrite(
         let h = unsafe { host(fs)? };
         // SAFETY: `file_context` is a live Handle.
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("overwrite", &p.to_string()); }
         let info = h.overwrite(handle, file_attributes, replace_file_attributes != 0, allocation_size)?;
         if !file_info.is_null() {
             // SAFETY: `file_info` is a valid out-param.
@@ -362,6 +391,7 @@ unsafe extern "C" fn write(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("write", &p.to_string()); }
         if (buffer.is_null() && length != 0) || p_bytes_transferred.is_null() {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -386,6 +416,7 @@ unsafe extern "C" fn flush(fs: *mut FspFileSystem, file_context: PVOID, file_inf
         let h = unsafe { host(fs)? };
         // A NULL context flushes the whole volume (no per-file info to report).
         let handle = if file_context.is_null() { None } else { Some(unsafe { handle(file_context)? }) };
+        if let Some(hd) = &handle && let Ok(p) = hd.path.read() { crate::dlog::dlog_enter("flush", &p.to_string()); }
         if let Some(info) = h.flush(handle)?
             && !file_info.is_null()
         {
@@ -427,6 +458,7 @@ unsafe extern "C" fn set_basic_info(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("set_basic_info", &p.to_string()); }
         let info =
             h.set_basic_info(handle, file_attributes, creation_time, last_access_time, last_write_time, change_time)?;
         if !file_info.is_null() {
@@ -447,6 +479,7 @@ unsafe extern "C" fn set_file_size(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("set_file_size", &p.to_string()); }
         let info = h.set_file_size(handle, new_size, set_allocation_size != 0)?;
         if !file_info.is_null() {
             // SAFETY: `file_info` is a valid out-param.
@@ -460,6 +493,7 @@ unsafe extern "C" fn can_delete(fs: *mut FspFileSystem, file_context: PVOID, _fi
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("can_delete", &p.to_string()); }
         // `FileName` is informational — the handle's resolved path is better.
         h.can_delete(handle)
     })
@@ -474,6 +508,7 @@ unsafe extern "C" fn set_delete(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("set_delete", &p.to_string()); }
         h.set_delete(handle, delete_file != 0)
     })
 }
@@ -488,6 +523,7 @@ unsafe extern "C" fn rename(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("rename", &p.to_string()); }
         // SAFETY: `new_file_name` is a NUL-terminated request string.
         let new_name = unsafe { str16(new_file_name)? };
         h.rename(handle, &new_name, replace_if_exists != 0)
@@ -563,7 +599,17 @@ unsafe extern "C" fn read_directory(
             // `length` and `pbytes` are this call's ReadDirectory params.
             unsafe { add(&raw mut d.info, buffer, length, pbytes) != 0 }
         };
-        let done = h.read_directory(handle, marker.as_deref(), &mut emit)?;
+        let dpath = handle.path.read().map(|p| p.to_string()).unwrap_or_else(|_| "?".to_owned());
+        let rr = h.read_directory(handle, marker.as_deref(), &mut emit);
+        crate::dlog::dlog_call(
+            "read_directory",
+            &dpath,
+            &match &rr {
+                Ok(_) => "ok".to_owned(),
+                Err(e) => format!("status 0x{:08x}", *e as u32),
+            },
+        );
+        let done = rr?;
         if done {
             // A NULL DirInfo is the EOF marker telling the FSD the listing
             // is complete.
@@ -582,6 +628,7 @@ unsafe extern "C" fn get_dir_info_by_name(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
+        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("get_dir_info_by_name", &p.to_string()); }
         // SAFETY: `file_name` is a NUL-terminated single-component name.
         let name = unsafe { str16(file_name)? };
         let buf = h.get_dir_info_by_name(handle, &name)?;

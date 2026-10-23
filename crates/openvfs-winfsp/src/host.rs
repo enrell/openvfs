@@ -190,7 +190,6 @@ impl Host {
             return Ok(hit);
         }
         write(&self.fold_cache).remove(&folded);
-
         self.folded_walk(want)
     }
 
@@ -454,9 +453,13 @@ impl Host {
         if meta.is_dir() && must_file {
             return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
-        if meta.is_dir() && !wants_dir {
-            return Err(STATUS_FILE_IS_A_DIRECTORY);
-        }
+        // A directory opened *without* FILE_DIRECTORY_FILE is normal: the FSD
+        // opens a directory by name when it looks up its attributes or lists
+        // it, and it sets neither flag on that path. Refusing the open there
+        // makes every directory under the mount unreachable (the FSD reports
+        // STATUS_FILE_IS_A_DIRECTORY as "access denied"), so a directory is
+        // served as a directory whatever the flags say. Only an explicit
+        // FILE_NON_DIRECTORY_FILE (the caller insists on a file) is refused.
         if meta.is_file() && wants_dir {
             return Err(STATUS_NOT_A_DIRECTORY);
         }
