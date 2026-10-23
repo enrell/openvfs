@@ -111,11 +111,11 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "open-vfs"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "openvfs-hook"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ilhook",
  "serde",
@@ -126,14 +126,14 @@ dependencies = [
 
 [[package]]
 name = "openvfs-sandbox"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "open-vfs",
 ]
 
 [[package]]
 name = "openvfs-winfsp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "open-vfs",
  "windows-sys 0.61.2",

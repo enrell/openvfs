@@ -3,7 +3,7 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project follows
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.1.2] — 2026-10-23
 
 ### Removed
 - `openvfs-mods` (mod-management layer and CLI) — openvfs is the bridge between applications and a VFS;
@@ -21,6 +21,24 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the pr
 - **`openvfs-hook`** (Windows): per-process merged view via Win32 API detours (`ilhook` engine): `CreateFile*`,
   `Find*`, attributes, delete/rename/copy/move, writes captured to `overwrite`, whiteouts; injector + synthetic
   program verified end-to-end live. Foundation grade — see `docs/hook-spec.md` for coverage and remaining work.
+
+- Read-only `PhysicalFs` instances cache metadata and listings, and `OverlayFs` caches merged lookups, dropping its
+  caches whenever a write changes the view. A view over a hundred layers no longer walks every layer per lookup.
+- `OPENVFS_WINFSP_LOG` (`openvfs-winfsp`): an opt-in log of the WinFsp callbacks, for diagnosing stalls, and the
+  `replay` example, which replays such a log against the host logic with no driver and times each kind of call.
+
+### Changed
+- **Lookups and listings over many layers are fast enough to run a game from a mount.** A game started from a view
+  of 113 mods sat without a window while the host burned a core: listing one 2,452-file folder took ~10 s. Now it
+  takes ~0.13 s, and replaying the game's first minute of file-system calls went from 160 s to under 3 s:
+  - a lookup in a read-only layer is answered from its cached parent: a path under a missing folder costs no system
+    call, and a name the folder does not hold is ruled out from the folder's names, read once;
+  - a missing path is classified from the walk that found it missing, instead of re-examining every ancestor with
+    two failing system calls each (this was most of the cost: every lookup misses in the empty upper layer);
+  - `ReadDirectory` lists a directory once per scan and serves every page from that snapshot, instead of listing,
+    sorting and re-reading the metadata of the whole directory for every page the kernel asks for.
+
+## [0.1.1] — 2026-10-15
 
 ### Fixed
 - `PhysicalFs::read_dir` returns entries sorted by name. On Linux and macOS the on-disk order is arbitrary, which made

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/openvfs", "crates/openvfs-hook", "crates/openvfs-sandbox", "crates/openvfs-winfsp"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 # let-chains (`if let … && …`) need 1.88.
