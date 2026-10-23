@@ -398,6 +398,33 @@ impl<T: FileSystem + ?Sized> FileSystem for Arc<T> {
     }
 }
 
+/// A cached "missing" answer: which of the two missing errors it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Missing {
+    NotFound,
+    NotADirectory,
+}
+
+impl Missing {
+    /// The error for `path`.
+    pub(crate) fn error(self, path: &VPath) -> VfsError {
+        match self {
+            Self::NotFound => VfsError::NotFound(path.clone()),
+            Self::NotADirectory => VfsError::NotADirectory(path.clone()),
+        }
+    }
+
+    /// What to cache for a lookup's `result`, or `None` for an error that must not be cached.
+    pub(crate) fn cacheable<T: Clone>(result: &Result<T>) -> Option<std::result::Result<T, Self>> {
+        match result {
+            Ok(found) => Some(Ok(found.clone())),
+            Err(VfsError::NotFound(_)) => Some(Err(Self::NotFound)),
+            Err(VfsError::NotADirectory(_)) => Some(Err(Self::NotADirectory)),
+            Err(_) => None,
+        }
+    }
+}
+
 /// Builds the right "missing" error for `path`: [`VfsError::NotADirectory`]
 /// if the nearest existing ancestor is a file, [`VfsError::NotFound`] otherwise.
 pub(crate) fn classify_missing(path: &VPath, mut kind_of: impl FnMut(&VPath) -> Option<FileType>) -> VfsError {

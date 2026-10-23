@@ -230,3 +230,52 @@ fn special_files_and_unaddressable_names_are_invisible() {
     }
     assert_eq!(common::names(&**vfs.backend(), "/"), ["ok.txt"]);
 }
+
+/// What a lookup answers, reduced to what callers can tell apart.
+fn answer(fs: &PhysicalFs, path: &str) -> Result<(bool, u64), std::io::ErrorKind> {
+    let meta = fs.metadata(&path.parse().unwrap()).map_err(|e| e.kind())?;
+    Ok((meta.is_dir(), meta.len))
+}
+
+#[test]
+fn a_cached_read_only_host_answers_like_an_uncached_one() {
+    let dir = TempDir::new("cached-vs-plain");
+    std::fs::create_dir_all(dir.path().join("d/sub")).unwrap();
+    std::fs::write(dir.path().join("d/f.txt"), "abc").unwrap();
+    let cached = PhysicalFs::read_only(dir.path()).unwrap();
+    let plain = PhysicalFs::new(dir.path()).unwrap();
+    for path in [
+        "/",
+        "/d",
+        "/d/f.txt",
+        "/d/sub",
+        "/d/missing",
+        "/d/f.txt/below",
+        "/d/f.txt/a/b",
+        "/nope",
+        "/nope/below/deeper",
+        "/d/sub/nope/deeper",
+        "/d/con", // a device name on Windows, simply missing elsewhere
+    ] {
+        let expected = answer(&plain, path);
+        assert_eq!(answer(&cached, path), expected, "{path}, first lookup");
+        assert_eq!(answer(&cached, path), expected, "{path}, from the cache");
+    }
+}
+
+#[test]
+fn a_cached_read_only_host_still_denies_links() {
+    let Some(lab) = link_lab() else {
+        eprintln!("skipped: this host does not allow creating symlinks");
+        return;
+    };
+    let cached = PhysicalFs::read_only(lab.root.path()).unwrap();
+    // The link itself, then paths below it — asked in both orders, so each is the first lookup once.
+    for path in ["/inside_link", "/inside_link/data.txt", "/escape/secret.txt", "/dangling", "/loop/inside/data.txt"] {
+        assert!(matches!(answer(&cached, path), Err(std::io::ErrorKind::PermissionDenied)), "{path}");
+        assert!(matches!(answer(&cached, path), Err(std::io::ErrorKind::PermissionDenied)), "{path} (cached)");
+    }
+    let fresh = PhysicalFs::read_only(lab.root.path()).unwrap();
+    assert!(matches!(answer(&fresh, "/inside_link/data.txt"), Err(std::io::ErrorKind::PermissionDenied)));
+    assert_eq!(answer(&fresh, "/inside/data.txt"), Ok((false, 4)));
+}

@@ -109,7 +109,8 @@ fn create_collisions_and_kind_mismatches() {
     assert_eq!(h.create("\\X", 0, RW, NORMAL_ATTRS).map(|_| ()).unwrap_err(), STATUS_OBJECT_NAME_COLLISION);
 
     h.create("\\d", FILE_DIRECTORY_FILE, RW, NORMAL_ATTRS).unwrap();
-    assert_eq!(h.open("\\d", 0, R).map(|_| ()).unwrap_err(), STATUS_FILE_IS_A_DIRECTORY);
+    // With neither flag the FSD is looking the name up: a directory is served as one.
+    assert!(h.open("\\d", 0, R).unwrap().0.is_dir);
     assert_eq!(h.open("\\d", FILE_NON_DIRECTORY_FILE, R).map(|_| ()).unwrap_err(), STATUS_FILE_IS_A_DIRECTORY);
     assert_eq!(h.open("\\x", FILE_DIRECTORY_FILE, R).map(|_| ()).unwrap_err(), STATUS_NOT_A_DIRECTORY);
 }
@@ -252,4 +253,66 @@ fn invalid_names_are_rejected() {
     // `:` marks a named stream — unsupported, must not reach the backend.
     assert!(h.open("\\f:hidden", 0, R).is_err());
     assert!(h.create("\\f:hidden", 0, RW, NORMAL_ATTRS).is_err());
+}
+
+/// Reads a whole directory the way the kernel does: `page` records at a time, each request
+/// resuming after the last name of the one before.
+fn paged_names(h: &Host, dir: &Handle, page: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let mut taken = 0;
+        let mut last = None;
+        let mut emit = |d: &mut DirInfoBuf| -> bool {
+            let name = buf_name(d);
+            names.push(name.clone());
+            last = Some(name);
+            taken += 1;
+            taken < page
+        };
+        if h.read_directory(dir, marker.as_deref(), &mut emit).unwrap() {
+            return names;
+        }
+        marker = last;
+    }
+}
+
+#[test]
+fn a_paged_scan_lists_every_entry_once_in_order() {
+    let h = default_host();
+    for i in 0..100 {
+        h.create(&format!("\\f{i:03}.dds"), 0, RW, NORMAL_ATTRS).unwrap();
+    }
+    let (dir, _) = h.open("\\", FILE_DIRECTORY_FILE, R).unwrap();
+    let whole = dir_names(&h, &dir);
+    assert_eq!(whole.len(), 102);
+    for page in [1, 2, 7, 30, 101, 500] {
+        assert_eq!(paged_names(&h, &dir, page), whole, "{page} records per request");
+    }
+}
+
+#[test]
+fn resuming_after_a_name_that_sorts_before_the_dots_does_not_repeat_them() {
+    let h = default_host();
+    for n in ["$first", "a", "b"] {
+        h.create(&format!("\\{n}"), 0, RW, NORMAL_ATTRS).unwrap();
+    }
+    let (dir, _) = h.open("\\", FILE_DIRECTORY_FILE, R).unwrap();
+    let mut names = Vec::new();
+    let mut emit = |d: &mut DirInfoBuf| -> bool {
+        names.push(buf_name(d));
+        true
+    };
+    assert!(h.read_directory(&dir, Some("$first"), &mut emit).unwrap());
+    assert_eq!(names, ["a", "b"]);
+}
+
+#[test]
+fn a_scan_that_starts_over_sees_what_changed_since() {
+    let h = default_host();
+    h.create("\\a", 0, RW, NORMAL_ATTRS).unwrap();
+    let (dir, _) = h.open("\\", FILE_DIRECTORY_FILE, R).unwrap();
+    assert_eq!(dir_names(&h, &dir), [".", "..", "a"]);
+    h.create("\\b", 0, RW, NORMAL_ATTRS).unwrap();
+    assert_eq!(dir_names(&h, &dir), [".", "..", "a", "b"], "no marker means a new scan");
 }

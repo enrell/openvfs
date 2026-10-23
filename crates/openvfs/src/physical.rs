@@ -1,13 +1,13 @@
 //! A file system backed by a directory on the host.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Result, VfsError};
-use crate::fs::{DirEntry, FileSystem, FileType, Metadata, OpenOptions, VfsFile, classify_missing, msg};
+use crate::fs::{DirEntry, FileSystem, FileType, Metadata, Missing, OpenOptions, VfsFile, classify_missing, msg};
 use crate::path::VPath;
 
 /// How [`PhysicalFs`] treats symbolic links (and, on Windows, junctions).
@@ -59,14 +59,48 @@ pub struct PhysicalFs {
     root: PathBuf,
     read_only: bool,
     symlinks: Symlinks,
-    /// `path -> resolved host path + metadata` (`None` = known missing).
+    /// `path -> resolved host path + metadata`, or which way it is missing.
     /// Only populated for read-only instances: their host tree does not change
     /// while a mount is live, and the layers of a game's virtual view are
     /// exactly that. A writable instance keeps every lookup uncached.
-    meta_cache: Option<Arc<RwLock<HashMap<VPath, Option<(PathBuf, Metadata)>>>>>,
+    meta_cache: Cache<Result<(PathBuf, Metadata), Missing>>,
     /// `dir -> entries`. Same policy as `meta_cache`.
-    dir_cache: Option<Arc<RwLock<HashMap<VPath, Arc<Vec<DirEntry>>>>>>,
+    dir_cache: Cache<Arc<Vec<DirEntry>>>,
+    /// `dir -> lowercase names of everything in it` (links included), `None` when it could not be
+    /// read. Same policy as `meta_cache`. It only rules names out: a name that is in the set still
+    /// goes to the host, which decides what it is.
+    names_cache: Cache<Option<Arc<HashSet<String>>>>,
 }
+
+/// What walking the components of a path on the host turned up.
+enum Walk {
+    /// The path exists; this is its own metadata (not a link).
+    Found(fs::Metadata),
+    /// A component does not exist. `under_file`: the nearest one that does is a file.
+    Missing { under_file: bool },
+    /// Not walked (links are followed), or the host failed in some other way.
+    Unknown,
+}
+
+impl Walk {
+    fn found(self) -> Option<fs::Metadata> {
+        match self {
+            Self::Found(meta) => Some(meta),
+            Self::Missing { .. } | Self::Unknown => None,
+        }
+    }
+}
+
+/// What [`PhysicalFs::stat_below_parent`] found.
+enum Below {
+    /// The parent is missing or a file, so `path` is too; no host call was made.
+    Derived(VfsError),
+    /// The host was asked about `path` itself.
+    Probed(Result<(PathBuf, Metadata)>),
+}
+
+/// A per-path cache kept by read-only instances; `None` for writable ones.
+type Cache<V> = Option<Arc<RwLock<HashMap<VPath, V>>>>;
 
 /// Configures a [`PhysicalFs`]; created by [`PhysicalFs::builder`].
 #[derive(Debug, Clone)]
@@ -105,6 +139,7 @@ impl PhysicalFsBuilder {
             symlinks: self.symlinks,
             meta_cache: cache.then(|| Arc::new(RwLock::new(HashMap::new()))),
             dir_cache: cache.then(|| Arc::new(RwLock::new(HashMap::new()))),
+            names_cache: cache.then(|| Arc::new(RwLock::new(HashMap::new()))),
         })
     }
 }
@@ -146,7 +181,7 @@ impl PhysicalFs {
     /// [`host_path`](Self::host_path), plus the target's own metadata whenever the
     /// confinement check already had to fetch it (it saves a system call, and those
     /// dominate the cost of every operation).
-    fn resolve(&self, path: &VPath) -> Result<(PathBuf, Option<fs::Metadata>)> {
+    fn resolve(&self, path: &VPath) -> Result<(PathBuf, Walk)> {
         let mut host = self.root.clone();
         for component in path.components() {
             if !is_valid_component(component) {
@@ -154,31 +189,35 @@ impl PhysicalFs {
             }
             host.push(component);
         }
-        let mut known = None;
+        let mut walk = Walk::Unknown;
         match self.symlinks {
-            Symlinks::Deny => known = self.deny_links(path)?,
+            Symlinks::Deny => walk = self.deny_links(path)?,
             Symlinks::FollowWithinRoot => self.ensure_inside(&host, path)?,
         }
-        Ok((host, known))
+        Ok((host, walk))
     }
 
     /// Fails if any existing component of `path` is a link. Otherwise returns the
-    /// metadata of `path` itself, or `None` if it (or an ancestor) does not exist.
+    /// metadata of `path` itself, or says where the walk ended without it.
     ///
     /// Costs one `lstat` per component. A component that is not a link has the same
     /// metadata whether or not links are followed, so the last one doubles as `stat`.
-    fn deny_links(&self, path: &VPath) -> Result<Option<fs::Metadata>> {
+    fn deny_links(&self, path: &VPath) -> Result<Walk> {
         let mut probe = self.root.clone();
-        let mut last = None;
+        let mut last: Option<fs::Metadata> = None;
         for component in path.components() {
             probe.push(component);
             match probe.symlink_metadata() {
                 Ok(meta) if meta.file_type().is_symlink() => return Err(VfsError::PermissionDenied(path.clone())),
                 Ok(meta) => last = Some(meta),
-                Err(_) => return Ok(None), // the rest does not exist (yet)
+                // The rest does not exist (yet), and the nearest ancestor that does is `last`.
+                Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+                    return Ok(Walk::Missing { under_file: last.as_ref().is_some_and(fs::Metadata::is_file) });
+                }
+                Err(_) => return Ok(Walk::Unknown), // let the host say what is wrong
             }
         }
-        Ok(last)
+        Ok(last.map_or(Walk::Unknown, Walk::Found))
     }
 
     /// Resolves the deepest existing ancestor of `host` and checks it is
@@ -218,17 +257,14 @@ impl PhysicalFs {
     fn stat(&self, path: &VPath) -> Result<(PathBuf, Metadata)> {
         if let Some(cache) = &self.meta_cache {
             if let Some(hit) = cache.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(path).cloned() {
-                return match hit {
-                    Some((host, meta)) => Ok((host, meta)),
-                    None => Err(VfsError::NotFound(path.clone())),
-                };
+                return hit.map_err(|missing| missing.error(path));
             }
-            let result = self.stat_uncached(path);
-            let entry = match &result {
-                Ok((host, meta)) => Some((host.clone(), meta.clone())),
-                Err(VfsError::NotFound(_) | VfsError::NotADirectory(_)) => None,
-                Err(_) => return result,
+            let result = match self.stat_below_parent(path) {
+                Some(Below::Derived(e)) => return Err(e),
+                Some(Below::Probed(result)) => result,
+                None => self.stat_uncached(path),
             };
+            let Some(entry) = Missing::cacheable(&result) else { return result };
             cache.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.clone(), entry);
             return result;
         }
@@ -257,12 +293,87 @@ impl PhysicalFs {
         Ok(entries)
     }
 
+    /// `false` only when the host directory `dir` certainly has no entry called `name`.
+    ///
+    /// Names that are not plain ASCII are always "maybe": the host may fold them in ways the
+    /// lowercase set does not.
+    fn may_contain(&self, dir: &VPath, dir_host: &Path, name: &str) -> bool {
+        let Some(cache) = &self.names_cache else { return true };
+        if !name.is_ascii() {
+            return true;
+        }
+        let known = cache.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(dir).cloned();
+        let names = known.unwrap_or_else(|| {
+            let scanned = fs::read_dir(dir_host).ok().map(|entries| {
+                Arc::new(
+                    entries
+                        .filter_map(|e| e.ok()?.file_name().to_str().map(str::to_lowercase))
+                        .collect::<HashSet<String>>(),
+                )
+            });
+            cache.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(dir.clone(), scanned.clone());
+            scanned
+        });
+        names.is_none_or(|names| names.contains(&name.to_lowercase()))
+    }
+
+    /// The cheap lookup for a cached instance: the parent decides.
+    ///
+    /// The parent is itself looked up through the cache, so it was already checked for links on the
+    /// way in. If it is missing or a file, so is `path` — no system call, and nothing worth caching:
+    /// the answer is the parent's, one lookup away. If it is a directory, `path` costs one `lstat`
+    /// instead of one per component plus a second failing `stat`.
+    /// This matters when many layers are probed for many paths: most layers lack the directory, and
+    /// the answer is the same for every file in it. Caching each of those misses instead would add an
+    /// entry per path per layer.
+    ///
+    /// `None` when the shortcut does not apply (root, or links are followed).
+    fn stat_below_parent(&self, path: &VPath) -> Option<Below> {
+        if self.symlinks != Symlinks::Deny {
+            return None;
+        }
+        let parent = path.parent()?;
+        let name = path.file_name()?;
+        let (parent_host, parent_meta) = match self.stat(&parent) {
+            Ok(found) => found,
+            Err(VfsError::NotFound(_)) => return Some(Below::Derived(VfsError::NotFound(path.clone()))),
+            Err(VfsError::NotADirectory(_)) => return Some(Below::Derived(VfsError::NotADirectory(path.clone()))),
+            Err(e) => return Some(Below::Probed(Err(e.with_path(path)))),
+        };
+        if !parent_meta.is_dir() {
+            return Some(Below::Derived(VfsError::NotADirectory(path.clone())));
+        }
+        if !is_valid_component(name) {
+            return Some(Below::Probed(Err(VfsError::InvalidPath(path.to_string()))));
+        }
+        // Most layers have the directory but not the file; asking the host about each one is a
+        // failing system call per layer per file, so the directory's names are read once instead.
+        if !self.may_contain(&parent, &parent_host, name) {
+            return Some(Below::Derived(VfsError::NotFound(path.clone())));
+        }
+        let host = parent_host.join(name);
+        let meta = match host.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Some(Below::Probed(Err(VfsError::PermissionDenied(path.clone()))));
+            }
+            Ok(meta) => meta,
+            Err(e) => return Some(Below::Probed(Err(self.host_err(path, e)))),
+        };
+        if !meta.is_dir() && !meta.is_file() {
+            return Some(Below::Probed(Err(VfsError::NotFound(path.clone())))); // devices, sockets, FIFOs are out of scope
+        }
+        Some(Below::Probed(Ok((host, self.convert(&meta)))))
+    }
 
     fn stat_uncached(&self, path: &VPath) -> Result<(PathBuf, Metadata)> {
-        let (host, known) = self.resolve(path)?;
-        let meta = match known {
-            Some(meta) => meta,
-            None => fs::metadata(&host).map_err(|e| self.host_err(path, e))?,
+        let (host, walk) = self.resolve(path)?;
+        let meta = match walk {
+            Walk::Found(meta) => meta,
+            // Already known, so the host is not asked again and the ancestors are not re-examined
+            // to tell the two apart: this is what every miss in an empty layer costs.
+            Walk::Missing { under_file: true } => return Err(VfsError::NotADirectory(path.clone())),
+            Walk::Missing { under_file: false } => return Err(VfsError::NotFound(path.clone())),
+            Walk::Unknown => fs::metadata(&host).map_err(|e| self.host_err(path, e))?,
         };
         if !meta.is_dir() && !meta.is_file() {
             return Err(VfsError::NotFound(path.clone())); // devices, sockets, FIFOs are out of scope
@@ -370,8 +481,6 @@ fn same_entry(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
-
-
 impl FileSystem for PhysicalFs {
     fn metadata(&self, path: &VPath) -> Result<Metadata> {
         self.stat(path).map(|(_, meta)| meta)
@@ -383,12 +492,14 @@ impl FileSystem for PhysicalFs {
                 return Ok((*hit).clone());
             }
             let entries = self.read_dir_uncached(path)?;
-            cache.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.clone(), Arc::new(entries.clone()));
+            cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(path.clone(), Arc::new(entries.clone()));
             return Ok(entries);
         }
         self.read_dir_uncached(path)
     }
-
 
     fn create_dir(&self, path: &VPath) -> Result<()> {
         self.writable(path)?;
@@ -486,8 +597,8 @@ impl FileSystem for PhysicalFs {
         if options.is_write() {
             self.writable(path)?;
         }
-        let (host, known) = self.resolve(path)?;
-        match known.map_or_else(|| fs::metadata(&host), Ok) {
+        let (host, walk) = self.resolve(path)?;
+        match walk.found().map_or_else(|| fs::metadata(&host), Ok) {
             Ok(meta) if meta.is_dir() => return Err(VfsError::IsADirectory(path.clone())),
             Ok(meta) if !meta.is_file() => return Err(VfsError::NotFound(path.clone())),
             _ => {}

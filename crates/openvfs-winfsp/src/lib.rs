@@ -161,6 +161,7 @@ mod stub {
     impl Mount {
         /// Always fails with [`Error::UnsupportedPlatform`] — WinFsp exists
         /// only on Windows.
+        #[allow(clippy::self_named_constructors)] // `Mount::mount(fs, point, opts)` is the public API
         pub fn mount<F>(fs: F, mountpoint: &Path, opts: MountOptions) -> Result<Self, Error>
         where
             F: FileSystem + 'static,

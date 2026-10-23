@@ -82,6 +82,7 @@ impl Mount {
     /// parameters or mount point, [`Error::InvalidMountPoint`] for a malformed
     /// mount point, and [`Error::Vfs`] when the backend rejects the mount
     /// (e.g. a root that is not a directory).
+    #[allow(clippy::self_named_constructors)] // `Mount::mount(fs, point, opts)` is the public API
     pub fn mount<F>(fs: F, mountpoint: &Path, opts: MountOptions) -> Result<Self, Error>
     where
         F: FileSystem + 'static,

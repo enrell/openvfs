@@ -25,7 +25,7 @@ use openvfs::{FileSystem, Metadata, OpenOptions, VPath, VfsError, VfsFile};
 use crate::abi::{DirInfoBuf, FspFsctlFileInfo, FspFsctlVolumeInfo, allocation_size};
 use crate::attrs::{self, AttrMap};
 use crate::options::MountOptions;
-use crate::pathx::{WinPath, fold, fold_path, is_after_marker, win_to_vpath};
+use crate::pathx::{WinPath, entry_key, fold, fold_path, win_to_vpath};
 use crate::security::permissive_security_descriptor;
 use crate::status::{NtStatus, status_of, status_of_io};
 use crate::status::{
@@ -79,6 +79,19 @@ pub struct Handle {
     pub file: Option<Mutex<Box<dyn VfsFile>>>,
     /// All writes go to EOF (`FILE_APPEND_DATA`-only opens).
     pub append: bool,
+    /// The listing a directory scan is paging through. The kernel asks for a directory a few
+    /// entries at a time, each request resuming after the last name returned; listing the
+    /// directory again for every request makes a scan quadratic. A scan builds this when it starts
+    /// (no marker) and every later page searches it.
+    listing: Mutex<Option<Arc<Vec<Listed>>>>,
+}
+
+/// One directory entry as a scan reports it.
+struct Listed {
+    /// `(folded name, name)`: the enumeration order, and the name itself in `.1`.
+    key: (String, String),
+    name16: Vec<u16>,
+    info: FspFsctlFileInfo,
 }
 
 impl Handle {
@@ -364,6 +377,7 @@ impl Host {
             is_dir,
             file,
             append: granted & FILE_APPEND_DATA != 0 && granted & (FILE_WRITE_DATA | FILE_READ_DATA) == 0,
+            listing: Mutex::new(None),
         }
     }
 
@@ -768,40 +782,62 @@ impl Host {
         if !h.is_dir {
             return Err(STATUS_NOT_A_DIRECTORY);
         }
-        let dir = h.path();
-        let entries = self.fs.read_dir(&dir).map_err(|e| status_of(&e, false))?;
-
-        // One record per entry: (name-to-report, path-of-node). Skip entries
-        // whose metadata disappeared mid-listing — a listing is a snapshot.
-        let mut items: Vec<(String, VPath, Metadata)> = Vec::with_capacity(entries.len() + 2);
-        let self_meta = self.metadata(&dir)?;
-        items.push((".".to_owned(), dir.clone(), self_meta.clone()));
-        let parent = dir.parent().unwrap_or_else(VPath::root);
-        let parent_meta = self.metadata(&parent).unwrap_or_else(|_| self_meta.clone());
-        items.push(("..".to_owned(), parent, parent_meta));
-        for e in entries {
-            if let Ok(m) = self.fs.metadata(&e.path) {
-                items.push((e.name, e.path, m));
+        // No marker starts a scan (or restarts it): list now, so what the scan shows is one
+        // snapshot. A marker resumes the scan that is already running.
+        let listing = self.listing(h, marker.is_none())?;
+        // The two dot entries lead the listing whatever they would sort as.
+        let start = match marker {
+            None => 0,
+            Some(".") => 1,
+            Some("..") => 2,
+            Some(m) => {
+                let key = entry_key(m);
+                2 + listing[2..].partition_point(|it| it.key <= key)
             }
-        }
-        // Stable enumeration order for all real entries (dots stay first only
-        // on the first page — they sort before everything anyway).
-        items[2..].sort_by(|a, b| (fold(&a.0), a.0.as_str()).cmp(&(fold(&b.0), b.0.as_str())));
-
+        };
         let mut buf = DirInfoBuf::new();
-        for (name, path, meta) in &items {
-            if let Some(m) = marker
-                && !is_after_marker(name, m)
-            {
-                continue;
-            }
-            let info = self.file_info(path, meta);
-            buf.set(&info, &name.encode_utf16().collect::<Vec<u16>>());
+        for it in &listing[start..] {
+            buf.set(&it.info, &it.name16);
             if !emit(&mut buf) {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// The handle's listing: the one its scan is paging through, or a fresh one.
+    fn listing(&self, h: &Handle, fresh: bool) -> Result<Arc<Vec<Listed>>, NtStatus> {
+        let mut slot = lock(&h.listing);
+        if !fresh && let Some(listing) = &*slot {
+            return Ok(Arc::clone(listing));
+        }
+        let built = Arc::new(self.list_dir(&h.path())?);
+        *slot = Some(Arc::clone(&built));
+        Ok(built)
+    }
+
+    /// `.`, `..`, then every entry in enumeration order. Entries whose metadata disappeared
+    /// mid-listing are left out: a listing is a snapshot.
+    fn list_dir(&self, dir: &VPath) -> Result<Vec<Listed>, NtStatus> {
+        let entries = self.fs.read_dir(dir).map_err(|e| status_of(&e, false))?;
+        let listed = |name: String, path: &VPath, meta: &Metadata| Listed {
+            name16: name.encode_utf16().collect(),
+            info: self.file_info(path, meta),
+            key: entry_key(&name),
+        };
+        let self_meta = self.metadata(dir)?;
+        let parent = dir.parent().unwrap_or_else(VPath::root);
+        let parent_meta = self.metadata(&parent).unwrap_or_else(|_| self_meta.clone());
+        let mut items = Vec::with_capacity(entries.len() + 2);
+        items.push(listed(".".to_owned(), dir, &self_meta));
+        items.push(listed("..".to_owned(), &parent, &parent_meta));
+        for e in entries {
+            if let Ok(m) = self.fs.metadata(&e.path) {
+                items.push(listed(e.name, &e.path, &m));
+            }
+        }
+        items[2..].sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        Ok(items)
     }
 
     /// `GetDirInfoByName` — single-entry lookup relative to a dir handle.

@@ -316,7 +316,9 @@ unsafe extern "C" fn overwrite(
         let h = unsafe { host(fs)? };
         // SAFETY: `file_context` is a live Handle.
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("overwrite", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("overwrite", &p.to_string());
+        }
         let info = h.overwrite(handle, file_attributes, replace_file_attributes != 0, allocation_size)?;
         if !file_info.is_null() {
             // SAFETY: `file_info` is a valid out-param.
@@ -391,7 +393,9 @@ unsafe extern "C" fn write(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("write", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("write", &p.to_string());
+        }
         if (buffer.is_null() && length != 0) || p_bytes_transferred.is_null() {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -416,7 +420,11 @@ unsafe extern "C" fn flush(fs: *mut FspFileSystem, file_context: PVOID, file_inf
         let h = unsafe { host(fs)? };
         // A NULL context flushes the whole volume (no per-file info to report).
         let handle = if file_context.is_null() { None } else { Some(unsafe { handle(file_context)? }) };
-        if let Some(hd) = &handle && let Ok(p) = hd.path.read() { crate::dlog::dlog_enter("flush", &p.to_string()); }
+        if let Some(hd) = &handle
+            && let Ok(p) = hd.path.read()
+        {
+            crate::dlog::dlog_enter("flush", &p.to_string());
+        }
         if let Some(info) = h.flush(handle)?
             && !file_info.is_null()
         {
@@ -458,7 +466,9 @@ unsafe extern "C" fn set_basic_info(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("set_basic_info", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("set_basic_info", &p.to_string());
+        }
         let info =
             h.set_basic_info(handle, file_attributes, creation_time, last_access_time, last_write_time, change_time)?;
         if !file_info.is_null() {
@@ -479,7 +489,9 @@ unsafe extern "C" fn set_file_size(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("set_file_size", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("set_file_size", &p.to_string());
+        }
         let info = h.set_file_size(handle, new_size, set_allocation_size != 0)?;
         if !file_info.is_null() {
             // SAFETY: `file_info` is a valid out-param.
@@ -493,7 +505,9 @@ unsafe extern "C" fn can_delete(fs: *mut FspFileSystem, file_context: PVOID, _fi
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("can_delete", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("can_delete", &p.to_string());
+        }
         // `FileName` is informational — the handle's resolved path is better.
         h.can_delete(handle)
     })
@@ -508,7 +522,9 @@ unsafe extern "C" fn set_delete(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("set_delete", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("set_delete", &p.to_string());
+        }
         h.set_delete(handle, delete_file != 0)
     })
 }
@@ -523,7 +539,9 @@ unsafe extern "C" fn rename(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("rename", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("rename", &p.to_string());
+        }
         // SAFETY: `new_file_name` is a NUL-terminated request string.
         let new_name = unsafe { str16(new_file_name)? };
         h.rename(handle, &new_name, replace_if_exists != 0)
@@ -628,7 +646,9 @@ unsafe extern "C" fn get_dir_info_by_name(
     ffi(|| {
         let h = unsafe { host(fs)? };
         let handle = unsafe { handle(file_context)? };
-        if let Ok(p) = handle.path.read() { crate::dlog::dlog_enter("get_dir_info_by_name", &p.to_string()); }
+        if let Ok(p) = handle.path.read() {
+            crate::dlog::dlog_enter("get_dir_info_by_name", &p.to_string());
+        }
         // SAFETY: `file_name` is a NUL-terminated single-component name.
         let name = unsafe { str16(file_name)? };
         let buf = h.get_dir_info_by_name(handle, &name)?;

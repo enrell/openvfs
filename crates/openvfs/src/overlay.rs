@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Result, VfsError};
-use crate::fs::{DirEntry, FileSystem, FileType, Metadata, OpenOptions, VfsFile, classify_missing, msg};
+use crate::fs::{DirEntry, FileSystem, FileType, Metadata, Missing, OpenOptions, VfsFile, classify_missing, msg};
 use crate::ops;
 use crate::path::VPath;
 use crate::sync;
@@ -57,12 +57,12 @@ pub struct OverlayFs {
     lowers: Vec<Arc<dyn FileSystem>>,
     /// The whiteouts, doubling as the lock that serializes structural changes.
     state: RwLock<Whiteouts>,
-    /// `path -> metadata` for content that came from a lower layer (`None` =
+    /// `path -> metadata` for content that came from a lower layer (an error =
     /// known missing). Lowers do not change while an overlay is live, so these
     /// entries are only dropped when a write touches the overlay. This is what
     /// keeps a view over a hundred mods usable: without it every lookup walks
     /// every layer again.
-    meta_cache: RwLock<HashMap<VPath, Option<Metadata>>>,
+    meta_cache: RwLock<HashMap<VPath, Result<Metadata, Missing>>>,
     /// Merged listings, same invalidation policy.
     dir_cache: RwLock<HashMap<VPath, Arc<Vec<DirEntry>>>>,
 }
@@ -243,13 +243,24 @@ impl OverlayFs {
         sync::write(&self.dir_cache).clear();
     }
 
+    /// Runs a change to the view under the state lock and drops the caches *before* releasing it.
+    ///
+    /// Lookups fill the caches while they hold the state lock for reading, so none can store what
+    /// it saw before the change after the caches were dropped.
+    fn change<T>(&self, f: impl FnOnce(&mut Whiteouts) -> T) -> T {
+        let mut w = sync::write(&self.state);
+        let r = f(&mut w);
+        self.invalidate();
+        r
+    }
+
     /// Hides `path` without touching any layer: records a whiteout so lower
     /// content at `path` becomes invisible. Unlike [`OverlayFs::remove_file`]
     /// and friends, nothing is deleted — this exists to *replay* whiteouts a
     /// caller persisted from [`OverlayFs::whiteouts`]. If `path` exists in the
     /// upper it stays visible; prefer `remove_*` for an actual delete.
     pub fn hide(&self, path: &VPath) {
-        sync::write(&self.state).hide(path);
+        self.change(|w| w.hide(path));
     }
 
     /// Cheap check for pending writes. May be `true` while [`OverlayFs::changes`]
@@ -313,16 +324,17 @@ impl OverlayFs {
 
     /// Discards every pending change: empties the upper layer and forgets whiteouts.
     pub fn reset(&self) -> Result<()> {
-        let mut w = sync::write(&self.state);
-        for entry in self.upper.read_dir(&VPath::root())? {
-            if entry.is_dir() {
-                self.upper.remove_dir_all(&entry.path)?;
-            } else {
-                self.upper.remove_file(&entry.path)?;
+        self.change(|w| {
+            for entry in self.upper.read_dir(&VPath::root())? {
+                if entry.is_dir() {
+                    self.upper.remove_dir_all(&entry.path)?;
+                } else {
+                    self.upper.remove_file(&entry.path)?;
+                }
             }
-        }
-        w.0.clear();
-        Ok(())
+            w.0.clear();
+            Ok(())
+        })
     }
 
     // --- lookup (all under the state lock) ---------------------------------
@@ -378,15 +390,6 @@ impl OverlayFs {
             }
         }
         Ok(merged)
-    }
-
-    fn metadata_in(&self, w: &Whiteouts, path: &VPath) -> Result<Metadata> {
-        match self.locate(w, path)? {
-            Some(Location::Upper(meta)) => Ok(meta),
-            // Lower files are writable *through the overlay* (copy-up).
-            Some(Location::Lower(_, meta)) => Ok(meta.with_read_only(self.upper.is_read_only())),
-            None => Err(self.missing(w, path)),
-        }
     }
 
     fn read_dir_in(&self, w: &Whiteouts, path: &VPath) -> Result<Vec<DirEntry>> {
@@ -684,26 +687,19 @@ impl fmt::Debug for OverlayFs {
 impl FileSystem for OverlayFs {
     fn metadata(&self, path: &VPath) -> Result<Metadata> {
         if let Some(hit) = sync::read(&self.meta_cache).get(path).cloned() {
-            return match hit {
-                Some(meta) => Ok(meta),
-                None => Err(VfsError::NotFound(path.clone())),
-            };
+            return hit.map_err(|missing| missing.error(path));
         }
+        // The state lock is held until the cache is filled: see `change`.
         let state = sync::read(&self.state);
-        let located = self.locate(&state, path);
-        drop(state);
-        let result = match located {
+        let result = match self.locate(&state, path) {
             // Upper content is writable: never cache it.
             Ok(Some(Location::Upper(meta))) => return Ok(meta),
             Ok(Some(Location::Lower(_, meta))) => Ok(meta.with_read_only(self.upper.is_read_only())),
-            Ok(None) => Err(self.missing(&Whiteouts::default(), path)),
+            // Classified with the whiteouts: a deleted lower file is not an ancestor that exists.
+            Ok(None) => Err(self.missing(&state, path)),
             Err(e) => Err(e),
         };
-        let entry = match &result {
-            Ok(meta) => Some(meta.clone()),
-            Err(VfsError::NotFound(_) | VfsError::NotADirectory(_)) => None,
-            Err(_) => return result,
-        };
+        let Some(entry) = Missing::cacheable(&result) else { return result };
         sync::write(&self.meta_cache).insert(path.clone(), entry);
         result
     }
@@ -712,53 +708,40 @@ impl FileSystem for OverlayFs {
         if let Some(hit) = sync::read(&self.dir_cache).get(path).cloned() {
             return Ok((*hit).clone());
         }
-        let entries = self.read_dir_in(&sync::read(&self.state), path)?;
+        let state = sync::read(&self.state);
+        let entries = self.read_dir_in(&state, path)?;
         sync::write(&self.dir_cache).insert(path.clone(), Arc::new(entries.clone()));
         Ok(entries)
     }
 
     fn create_dir(&self, path: &VPath) -> Result<()> {
-        let r = self.create_dir_in(&sync::write(&self.state), path);
-        self.invalidate();
-        r
+        self.change(|w| self.create_dir_in(w, path))
     }
 
     fn remove_file(&self, path: &VPath) -> Result<()> {
-        let r = self.remove_file_in(&mut sync::write(&self.state), path);
-        self.invalidate();
-        r
+        self.change(|w| self.remove_file_in(w, path))
     }
 
     fn remove_dir(&self, path: &VPath) -> Result<()> {
-        let r = self.remove_dir_in(&mut sync::write(&self.state), path, false);
-        self.invalidate();
-        r
+        self.change(|w| self.remove_dir_in(w, path, false))
     }
 
     fn remove_dir_all(&self, path: &VPath) -> Result<()> {
-        let r = self.remove_dir_in(&mut sync::write(&self.state), path, true);
-        self.invalidate();
-        r
+        self.change(|w| self.remove_dir_in(w, path, true))
     }
 
     fn rename(&self, from: &VPath, to: &VPath) -> Result<()> {
-        let r = self.rename_in(&mut sync::write(&self.state), from, to);
-        self.invalidate();
-        r
+        self.change(|w| self.rename_in(w, from, to))
     }
 
     fn copy_file(&self, from: &VPath, to: &VPath) -> Result<u64> {
-        let r = self.copy_file_in(&sync::write(&self.state), from, to);
-        self.invalidate();
-        r
+        self.change(|w| self.copy_file_in(w, from, to))
     }
 
     fn open(&self, path: &VPath, options: &OpenOptions) -> Result<Box<dyn VfsFile>> {
         options.validate()?;
         if options.is_write() {
-            let r = self.open_in(&sync::write(&self.state), path, *options);
-            self.invalidate();
-            r
+            self.change(|w| self.open_in(w, path, *options))
         } else {
             self.open_in(&sync::read(&self.state), path, *options)
         }
