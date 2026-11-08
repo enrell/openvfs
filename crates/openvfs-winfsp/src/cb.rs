@@ -544,7 +544,13 @@ unsafe extern "C" fn rename(
         }
         // SAFETY: `new_file_name` is a NUL-terminated request string.
         let new_name = unsafe { str16(new_file_name)? };
-        h.rename(handle, &new_name, replace_if_exists != 0)
+        let result = h.rename(handle, &new_name, replace_if_exists != 0);
+        let status = match &result {
+            Ok(()) => "ok".to_owned(),
+            Err(s) => format!("status {:#x}", *s as u32),
+        };
+        crate::dlog::dlog_call("rename", &new_name, &status);
+        result
     })
 }
 

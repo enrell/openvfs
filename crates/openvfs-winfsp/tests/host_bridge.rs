@@ -316,3 +316,76 @@ fn a_scan_that_starts_over_sees_what_changed_since() {
     h.create("\\b", 0, RW, NORMAL_ATTRS).unwrap();
     assert_eq!(dir_names(&h, &dir), [".", "..", "a", "b"], "no marker means a new scan");
 }
+
+/// A lower layer that ignores case the way NTFS does: every spelling of a
+/// path reaches the same file (stored lowercased).
+struct NtfsLike(MemoryFs);
+
+fn lower_case(p: &VPath) -> VPath {
+    VPath::new(p.as_str().to_lowercase()).unwrap()
+}
+
+impl FileSystem for NtfsLike {
+    fn metadata(&self, path: &VPath) -> openvfs::Result<openvfs::Metadata> {
+        self.0.metadata(&lower_case(path))
+    }
+    fn read_dir(&self, path: &VPath) -> openvfs::Result<Vec<openvfs::DirEntry>> {
+        self.0.read_dir(&lower_case(path))
+    }
+    fn create_dir(&self, path: &VPath) -> openvfs::Result<()> {
+        self.0.create_dir(&lower_case(path))
+    }
+    fn remove_file(&self, path: &VPath) -> openvfs::Result<()> {
+        self.0.remove_file(&lower_case(path))
+    }
+    fn remove_dir(&self, path: &VPath) -> openvfs::Result<()> {
+        self.0.remove_dir(&lower_case(path))
+    }
+    fn rename(&self, from: &VPath, to: &VPath) -> openvfs::Result<()> {
+        self.0.rename(&lower_case(from), &lower_case(to))
+    }
+    fn open(&self, path: &VPath, options: &OpenOptions) -> openvfs::Result<Box<dyn openvfs::VfsFile>> {
+        self.0.open(&lower_case(path), options)
+    }
+}
+
+/// xEdit saving over a game file: `Update.esm` is in the lower layer. It writes
+/// `Update.esm.save.<time>` (upper), moves the original into a backup folder,
+/// then renames the save to `Update.esm` — and Windows may spell the folder
+/// differently (`\DATA\`) than the whiteout left by the first move.
+fn save_over_lower_file(case_insensitive: bool) -> Result<Vec<u8>, i32> {
+    let lower = NtfsLike(MemoryFs::new());
+    lower.create_dir(&VPath::new("/Data").unwrap()).unwrap();
+    {
+        let mut f =
+            lower.open(&VPath::new("/Data/Update.esm").unwrap(), &OpenOptions::new().write(true).create(true)).unwrap();
+        f.write_all(b"dirty").unwrap();
+    }
+    let overlay = OverlayFs::new(MemoryFs::new(), lower).case_insensitive(case_insensitive);
+    let h = host_with(overlay, &MountOptions::default());
+
+    let (save, _) = h.create("\\Data\\Update.esm.save.1", 0, RW, NORMAL_ATTRS).unwrap();
+    h.write(&save, b"clean", 0, false, false).unwrap();
+    h.cleanup(&save, 0);
+    h.create("\\Data\\Backups", FILE_DIRECTORY_FILE, RW, NORMAL_ATTRS).unwrap();
+
+    let (orig, _) = h.open("\\Data\\Update.esm", 0, RW).unwrap();
+    h.rename(&orig, "\\Data\\Backups\\Update.esm.backup.1", false).unwrap();
+    h.cleanup(&orig, 0);
+
+    let (save, _) = h.open("\\Data\\Update.esm.save.1", 0, RW).unwrap();
+    h.rename(&save, "\\DATA\\Update.esm", false)?;
+    h.cleanup(&save, 0);
+
+    let (fh, _) = h.open("\\Data\\Update.esm", 0, R).unwrap();
+    let mut buf = [0u8; 16];
+    let n = h.read(&fh, &mut buf, 0).unwrap();
+    Ok(buf[..n].to_vec())
+}
+
+#[test]
+fn saving_over_a_lower_file_via_backup_and_rename() {
+    // Case-sensitive whiteouts let `\DATA\Update.esm` reach the moved original.
+    assert_eq!(save_over_lower_file(false), Err(STATUS_OBJECT_NAME_COLLISION));
+    assert_eq!(save_over_lower_file(true).unwrap(), b"clean");
+}

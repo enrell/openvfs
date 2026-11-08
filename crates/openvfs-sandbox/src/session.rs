@@ -87,7 +87,9 @@ impl<W: Write> Session<W> {
     /// Opens `dir` through a fresh overlay. Nothing is written to `dir`.
     pub fn open(dir: &Path, out: W, color: bool) -> Result<Self, VfsError> {
         let disk = Arc::new(PhysicalFs::new(dir)?);
-        let overlay = Arc::new(OverlayFs::with_layers(Arc::new(MemoryFs::new()), vec![disk.clone()]));
+        let overlay = Arc::new(
+            OverlayFs::with_layers(Arc::new(MemoryFs::new()), vec![disk.clone()]).case_insensitive(cfg!(windows)),
+        );
         Ok(Self {
             vfs: Vfs::from(Arc::clone(&overlay)),
             overlay,
