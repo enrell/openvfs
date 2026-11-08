@@ -114,36 +114,53 @@ impl fmt::Display for Change {
 
 /// Paths hidden from the lower layers (with everything below them).
 #[derive(Default)]
-struct Whiteouts(BTreeSet<VPath>);
+struct Whiteouts {
+    set: BTreeSet<VPath>,
+    /// Layers ignore case (Windows): a whiteout hides every spelling of its
+    /// path, so `/DATA/a.esm` can't reach a lower `/Data/a.esm` that was removed.
+    fold: bool,
+}
 
 impl Whiteouts {
+    /// The key `path` is stored and looked up under.
+    fn key(&self, path: &VPath) -> VPath {
+        if self.fold { VPath::new(path.folded().as_str()).unwrap_or_else(|_| path.clone()) } else { path.clone() }
+    }
+
     /// `true` if `path` or one of its ancestors is whited out.
     fn hides(&self, path: &VPath) -> bool {
-        !self.0.is_empty() && path.ancestors().any(|a| self.0.contains(&a))
+        !self.set.is_empty() && self.key(path).ancestors().any(|a| self.set.contains(&a))
+    }
+
+    /// `true` if `path` itself is whited out.
+    fn contains(&self, path: &VPath) -> bool {
+        self.set.contains(&self.key(path))
     }
 
     /// `true` if `dir` itself or anything below it is whited out.
     fn touches(&self, dir: &VPath) -> bool {
-        if self.0.contains(dir) {
+        let dir = self.key(dir);
+        if self.set.contains(&dir) {
             return true;
         }
         let prefix = dir.descendant_prefix();
-        self.0.range(VPath::bound(prefix.clone())..).next().is_some_and(|h| h.as_str().starts_with(&prefix))
+        self.set.range(VPath::bound(prefix.clone())..).next().is_some_and(|h| h.as_str().starts_with(&prefix))
     }
 
     /// Hides `path`; whiteouts below it become redundant and are dropped.
     fn hide(&mut self, path: &VPath) {
+        let path = &self.key(path);
         let prefix = path.descendant_prefix();
         let redundant: Vec<VPath> = self
-            .0
+            .set
             .range(VPath::bound(prefix.clone())..)
             .take_while(|h| h.as_str().starts_with(&prefix))
             .cloned()
             .collect();
         for h in redundant {
-            self.0.remove(&h);
+            self.set.remove(&h);
         }
-        self.0.insert(path.clone());
+        self.set.insert(path.clone());
     }
 }
 
@@ -219,6 +236,15 @@ impl OverlayFs {
         }
     }
 
+    /// Treats paths as case-insensitive, as the layers are on Windows: a
+    /// removed or renamed lower file stays hidden whatever spelling asks for
+    /// it. Off by default (paths are case-sensitive).
+    #[must_use]
+    pub fn case_insensitive(self, yes: bool) -> Self {
+        sync::write(&self.state).fold = yes;
+        self
+    }
+
     /// The writable layer.
     #[must_use]
     pub fn upper(&self) -> &Arc<dyn FileSystem> {
@@ -234,7 +260,7 @@ impl OverlayFs {
     /// The current whiteouts, sorted (useful for debugging and persistence).
     #[must_use]
     pub fn whiteouts(&self) -> Vec<VPath> {
-        sync::read(&self.state).0.iter().cloned().collect()
+        sync::read(&self.state).set.iter().cloned().collect()
     }
 
     /// Drops every cached lookup. Called by anything that changes the view.
@@ -267,7 +293,7 @@ impl OverlayFs {
     /// is empty — e.g. after a file was copied up but rewritten unchanged.
     pub fn is_dirty(&self) -> Result<bool> {
         let w = sync::read(&self.state);
-        Ok(!w.0.is_empty() || !self.upper.read_dir(&VPath::root())?.is_empty())
+        Ok(!w.set.is_empty() || !self.upper.read_dir(&VPath::root())?.is_empty())
     }
 
     /// Computes every difference between the merged view and the lowers.
@@ -332,7 +358,7 @@ impl OverlayFs {
                     self.upper.remove_file(&entry.path)?;
                 }
             }
-            w.0.clear();
+            w.set.clear();
             Ok(())
         })
     }
@@ -401,7 +427,7 @@ impl OverlayFs {
         let mut merged = BTreeMap::new();
         if !w.hides(path) {
             let lower = self.base_read_dir(path)?;
-            merged.extend(lower.into_iter().filter(|(name, _)| !w.0.contains(&path.child(name))));
+            merged.extend(lower.into_iter().filter(|(name, _)| !w.contains(&path.child(name))));
         }
         if in_upper {
             merged.extend(self.upper.read_dir(path)?.into_iter().map(|e| (e.name, e.file_type)));
@@ -679,7 +705,7 @@ impl fmt::Debug for OverlayFs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OverlayFs")
             .field("lowers", &self.lowers.len())
-            .field("whiteouts", &sync::read(&self.state).0.len())
+            .field("whiteouts", &sync::read(&self.state).set.len())
             .finish_non_exhaustive()
     }
 }
